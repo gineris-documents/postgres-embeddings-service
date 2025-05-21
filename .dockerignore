@@ -1,0 +1,21 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+
+# Local development
+.env
+.env.local
+
+# Logs
+*.log
