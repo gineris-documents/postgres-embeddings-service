@@ -10,6 +10,8 @@ from google.cloud import storage
 from sentence_transformers import SentenceTransformer
 import psycopg2
 import psycopg2.extras
+import google.auth
+from google.auth import default
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -44,10 +46,19 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service-account.j
 def get_drive_service():
     """Create and return a Google Drive service."""
     try:
-        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        service = build('drive', 'v3', credentials=creds)
-        logger.info("Successfully connected to Google Drive API")
-        return service
+        # First try to use service account file
+        if os.path.exists(SERVICE_ACCOUNT_FILE) and os.path.getsize(SERVICE_ACCOUNT_FILE) > 0:
+            creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+            service = build('drive', 'v3', credentials=creds)
+            logger.info("Successfully connected to Google Drive API using service account")
+            return service
+        else:
+            # Fall back to application default credentials
+            logger.warning(f"Service account file '{SERVICE_ACCOUNT_FILE}' not found or empty, using default credentials")
+            credentials, _ = default(scopes=SCOPES)
+            service = build('drive', 'v3', credentials=credentials)
+            logger.info("Successfully connected to Google Drive API using default credentials")
+            return service
     except Exception as e:
         logger.error(f"Failed to connect to Google Drive API: {str(e)}")
         raise
