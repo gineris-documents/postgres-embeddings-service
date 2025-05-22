@@ -5,7 +5,8 @@ import logging
 import io
 import re
 import numpy as np
-from flask import Flask, request, jsonify
+import http.server
+import socketserver
 from google.cloud import storage
 from sentence_transformers import SentenceTransformer
 import psycopg2
@@ -25,9 +26,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Initialize Flask app
-app = Flask(__name__)
 
 # Configuration
 PROJECT_ID = os.environ.get("PROJECT_ID", "pdf-to-pinecone")
@@ -387,28 +385,44 @@ def process_pending_documents():
         "errors": errors
     }
 
-@app.route("/", methods=["GET"])
-def home():
-    """Health check endpoint."""
-    return jsonify({"status": "healthy"})
+class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Handle GET requests - for health checks."""
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        response = {'status': 'healthy'}
+        self.wfile.write(json.dumps(response).encode('utf-8'))
+    
+    def do_POST(self):
+        """Handle POST requests - for document processing."""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            
+            # Process documents
+            results = process_pending_documents()
+            
+            # Send response
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {'success': True, 'results': results}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+        except Exception as e:
+            logger.error(f"Error in POST handler: {str(e)}")
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {'success': False, 'error': str(e)}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
 
-@app.route("/process", methods=["POST"])
-def process_documents_endpoint():
-    """Endpoint to trigger document processing."""
-    try:
-        results = process_pending_documents()
-        return jsonify({
-            "success": True,
-            "results": results
-        })
-    except Exception as e:
-        logger.error(f"Error in process endpoint: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+def run_server():
+    """Run the HTTP server."""
+    port = int(os.environ.get('PORT', 8080))
+    server = socketserver.TCPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    logger.info(f'Starting server on port {port}')
+    server.serve_forever()
 
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting server on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    run_server()
