@@ -120,6 +120,7 @@ def get_pending_documents():
             SELECT * FROM ai_data.document_tracking 
             WHERE status = 'pending'
             ORDER BY created_at ASC
+            LIMIT 1
             """
         )
         pending_docs = cursor.fetchall()
@@ -377,7 +378,7 @@ def process_document(doc_info):
 
 def process_pending_documents():
     """Process all pending documents."""
-    # Get pending documents
+    # Get pending documents (just one at a time to avoid timeouts)
     pending_docs = get_pending_documents()
     logger.info(f"Found {len(pending_docs)} pending documents")
     
@@ -407,6 +408,7 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-type', 'application/json')
         self.end_headers()
         
+        # Don't load the model on health checks to avoid timeouts
         response = {
             "status": "healthy",
             "service": "postgres-embeddings-service",
@@ -452,6 +454,13 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
 def run_server():
     """Run the HTTP server."""
     try:
+        # Print startup message
+        logger.info("Starting document processor service")
+        logger.info(f"Python version: {sys.version}")
+        logger.info(f"Working directory: {os.getcwd()}")
+        logger.info(f"Environment variables: PORT={PORT}, PG_HOST={PG_HOST}, PG_DATABASE={PG_DATABASE}")
+        
+        # Start the server
         httpd = socketserver.TCPServer(("", PORT), DocumentProcessorHandler)
         logger.info(f"Server listening on port {PORT}")
         httpd.serve_forever()
@@ -460,5 +469,4 @@ def run_server():
         sys.exit(1)
 
 if __name__ == "__main__":
-    logger.info("Starting document processor service")
     run_server()
