@@ -2,6 +2,9 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-COPY minimal_server.py .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "minimal_server.py"]
+COPY db_server.py .
+
+CMD ["python", "db_server.py"]
