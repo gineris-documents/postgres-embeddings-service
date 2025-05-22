@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir numpy==1.23.5
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY model_test_server.py .
+COPY document_processor.py .
 
-CMD ["python", "model_test_server.py"]
+# Create an empty service-account.json file if it doesn't exist
+RUN touch service-account.json
+
+CMD ["python", "document_processor.py"]
