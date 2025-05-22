@@ -13,4 +13,4 @@ COPY . .
 RUN touch service-account.json
 
 # Make sure the app listens on the port provided by Cloud Run
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
+CMD ["python", "app.py"]
