@@ -9,6 +9,10 @@ import psycopg2
 import psycopg2.extras
 import time
 import numpy as np
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import re
 from google.auth import default
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -220,10 +224,29 @@ def delete_previous_document_data(drive_file_id):
         cursor.close()
         conn.close()
 
-def extract_text_from_pdf(file_content):
-    """Extract text from a PDF file."""
+def clean_extracted_text(text: str) -> str:
+    """Clean up extracted text by removing excessive whitespace and fixing common issues."""
+    
+    # Remove excessive line breaks (more than 2 consecutive)
+    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+    
+    # Fix hyphenated words split across lines
+    text = re.sub(r'-\s*\n\s*', '', text)
+    
+    # Remove excessive spaces
+    text = re.sub(r' +', ' ', text)
+    
+    # Remove common OCR artifacts
+    text = re.sub(r'[|]', 'I', text)  # Common OCR mistake
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)  # Add space between camelCase
+    
+    return text.strip()
+
+def extract_text_from_pdf_fallback(file_content):
+    """Fallback to original pypdf extraction method."""
     try:
         from pypdf import PdfReader
+        file_content.seek(0)  # Reset file pointer
         reader = PdfReader(file_content)
         text = ""
         for page in reader.pages:
@@ -232,24 +255,158 @@ def extract_text_from_pdf(file_content):
                 text += page_text + "\n"
         return text
     except Exception as e:
-        logger.error(f"Error extracting text from PDF: {str(e)}")
-        raise
+        logger.error(f"Fallback extraction also failed: {str(e)}")
+        return ""
+
+def extract_text_from_pdf(file_content):
+    """Enhanced PDF text extraction with OCR fallback."""
+    try:
+        # Convert BytesIO to bytes for PyMuPDF
+        if hasattr(file_content, 'getvalue'):
+            pdf_bytes = file_content.getvalue()
+        else:
+            file_content.seek(0)
+            pdf_bytes = file_content.read()
+        
+        # Open PDF with PyMuPDF (much better than pypdf)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        all_text = ""
+        pages_with_ocr = 0
+        
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            
+            # First, try direct text extraction
+            page_text = page.get_text()
+            
+            # If we get very little text, the page might be scanned
+            if len(page_text.strip()) < 50:  # Threshold for "sparse text"
+                logger.info(f"Page {page_num + 1}: Little text found ({len(page_text.strip())} chars), trying OCR...")
+                
+                try:
+                    # Convert page to image with higher resolution for better OCR
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # 2x resolution
+                    img_data = pix.tobytes("png")
+                    
+                    # Use OCR on the image
+                    image = Image.open(io.BytesIO(img_data))
+                    ocr_text = pytesseract.image_to_string(image, lang='eng')
+                    
+                    if len(ocr_text.strip()) > len(page_text.strip()):
+                        page_text = ocr_text
+                        pages_with_ocr += 1
+                        logger.info(f"Page {page_num + 1}: OCR extracted {len(ocr_text.strip())} characters")
+                    else:
+                        logger.info(f"Page {page_num + 1}: Direct extraction was better")
+                        
+                except Exception as ocr_error:
+                    logger.warning(f"OCR failed for page {page_num + 1}: {str(ocr_error)}")
+            else:
+                logger.info(f"Page {page_num + 1}: Direct extraction got {len(page_text.strip())} characters")
+            
+            all_text += page_text + "\n"
+        
+        doc.close()
+        
+        if pages_with_ocr > 0:
+            logger.info(f"Used OCR on {pages_with_ocr} out of {len(doc)} pages")
+        
+        # Clean up the text
+        cleaned_text = clean_extracted_text(all_text)
+        logger.info(f"Final cleaned text length: {len(cleaned_text)} characters")
+        
+        return cleaned_text
+        
+    except Exception as e:
+        logger.error(f"Error in enhanced text extraction: {str(e)}")
+        # Fallback to original method
+        logger.info("Falling back to pypdf extraction...")
+        return extract_text_from_pdf_fallback(file_content)
+
+def simple_chunking_fallback(text):
+    """Simple fallback chunking method."""
+    chunk_size = 1000
+    chunk_overlap = 200
+    
+    chunks = []
+    for i in range(0, len(text), chunk_size - chunk_overlap):
+        chunk = text[i:i + chunk_size]
+        if chunk.strip():
+            chunks.append(chunk)
+    
+    return chunks
 
 def split_text_into_chunks(text):
-    """Split text into chunks."""
+    """Improved text chunking that respects sentence and paragraph boundaries."""
     try:
         chunk_size = 1000
         chunk_overlap = 200
         
-        chunks = []
-        for i in range(0, len(text), chunk_size - chunk_overlap):
-            chunk = text[i:i + chunk_size]
-            chunks.append(chunk)
+        # First, split by paragraphs (double newlines)
+        paragraphs = text.split('\n\n')
         
-        return chunks
+        chunks = []
+        current_chunk = ""
+        
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+                
+            # If adding this paragraph would exceed chunk size
+            if len(current_chunk) + len(paragraph) + 2 > chunk_size:  # +2 for \n\n
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    
+                    # Handle overlap by taking last sentences of previous chunk
+                    if chunk_overlap > 0:
+                        sentences = current_chunk.split('. ')
+                        overlap_text = ""
+                        for sentence in reversed(sentences):
+                            if len(overlap_text) + len(sentence) <= chunk_overlap:
+                                overlap_text = sentence + ". " + overlap_text if overlap_text else sentence
+                            else:
+                                break
+                        current_chunk = overlap_text.strip()
+                    else:
+                        current_chunk = ""
+                
+                # If the paragraph itself is too long, split it
+                if len(paragraph) > chunk_size:
+                    # Split long paragraphs at sentence boundaries
+                    sentences = paragraph.split('. ')
+                    temp_chunk = current_chunk
+                    
+                    for sentence in sentences:
+                        if len(temp_chunk) + len(sentence) + 2 <= chunk_size:
+                            temp_chunk = temp_chunk + ". " + sentence if temp_chunk else sentence
+                        else:
+                            if temp_chunk:
+                                chunks.append(temp_chunk.strip())
+                            temp_chunk = sentence
+                    
+                    current_chunk = temp_chunk
+                else:
+                    current_chunk = current_chunk + "\n\n" + paragraph if current_chunk else paragraph
+            else:
+                # Add paragraph to current chunk
+                current_chunk = current_chunk + "\n\n" + paragraph if current_chunk else paragraph
+        
+        # Add the last chunk
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        # Filter out very small chunks
+        final_chunks = [chunk for chunk in chunks if len(chunk.strip()) >= 50]
+        
+        logger.info(f"Created {len(final_chunks)} meaningful chunks from {len(chunks)} total chunks")
+        return final_chunks
+        
     except Exception as e:
-        logger.error(f"Error splitting text into chunks: {str(e)}")
-        raise
+        logger.error(f"Error in improved chunking: {str(e)}")
+        # Fallback to simple chunking
+        return simple_chunking_fallback(text)
 
 def process_document(doc_info):
     """Process a document from Google Drive."""
@@ -272,7 +429,7 @@ def process_document(doc_info):
         # Download file from Google Drive
         file_content = download_file_from_drive(drive_service, doc_info["drive_file_id"])
         
-        # Extract text from PDF
+        # Extract text from PDF using enhanced method
         text = extract_text_from_pdf(file_content)
         logger.info(f"Extracted {len(text)} characters of text from {doc_info['file_name']}")
         
@@ -281,7 +438,7 @@ def process_document(doc_info):
             update_document_status(doc_info["id"], "error", "No text could be extracted from the PDF")
             return False
         
-        # Split text into chunks
+        # Split text into chunks using improved method
         chunks = split_text_into_chunks(text)
         logger.info(f"Split text into {len(chunks)} chunks")
         
