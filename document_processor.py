@@ -224,37 +224,150 @@ def delete_previous_document_data(drive_file_id):
         cursor.close()
         conn.close()
 
-def clean_financial_text(text: str) -> str:
-    """Clean up extracted text specifically for financial documents."""
+def extract_with_layout_analysis(page):
+    """Extract text preserving layout structure using text blocks."""
+    try:
+        # Get text with layout information
+        blocks = page.get_text("dict")
+        
+        page_text = ""
+        for block in blocks.get("blocks", []):
+            if "lines" in block:
+                block_text = ""
+                for line in block["lines"]:
+                    line_text = ""
+                    for span in line.get("spans", []):
+                        line_text += span.get("text", "")
+                    if line_text.strip():
+                        block_text += line_text.strip() + "\n"
+                
+                if block_text.strip():
+                    page_text += block_text + "\n"
+        
+        return page_text
+    except Exception as e:
+        logger.warning(f"Layout analysis failed: {str(e)}")
+        return ""
+
+def extract_with_coordinates(page):
+    """Extract text using coordinate-based analysis for tables."""
+    try:
+        # Get all text with coordinates
+        text_dict = page.get_text("rawdict")
+        
+        # Group text by approximate Y coordinate (rows)
+        rows = {}
+        
+        for block in text_dict.get("blocks", []):
+            if "lines" in block:
+                for line in block["lines"]:
+                    y_coord = int(line["bbox"][1])  # Y coordinate
+                    if y_coord not in rows:
+                        rows[y_coord] = []
+                    
+                    for span in line.get("spans", []):
+                        x_coord = int(span["bbox"][0])  # X coordinate
+                        text = span.get("text", "").strip()
+                        if text:
+                            rows[y_coord].append((x_coord, text))
+        
+        # Sort rows by Y coordinate and build text
+        page_text = ""
+        for y in sorted(rows.keys()):
+            # Sort by X coordinate within each row
+            row_items = sorted(rows[y], key=lambda x: x[0])
+            row_text = " | ".join([item[1] for item in row_items])
+            if row_text.strip():
+                page_text += row_text + "\n"
+        
+        return page_text
+    except Exception as e:
+        logger.warning(f"Coordinate extraction failed: {str(e)}")
+        return ""
+
+def extract_with_advanced_ocr(page, file_content):
+    """Advanced OCR with preprocessing for financial documents."""
+    try:
+        # Convert page to high-resolution image
+        pix = page.get_pixmap(matrix=fitz.Matrix(4.0, 4.0))  # 4x resolution
+        img_data = pix.tobytes("png")
+        
+        # Open with PIL for preprocessing
+        image = Image.open(io.BytesIO(img_data))
+        
+        # Convert to grayscale
+        image = image.convert('L')
+        
+        # Enhance contrast for better OCR
+        from PIL import ImageEnhance
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)
+        
+        # OCR with multiple configurations
+        configs = [
+            '--oem 3 --psm 6',  # Uniform block of text
+            '--oem 3 --psm 4',  # Single column of text
+            '--oem 3 --psm 8',  # Single word
+            '--oem 3 --psm 11', # Sparse text
+        ]
+        
+        best_text = ""
+        max_length = 0
+        
+        for config in configs:
+            try:
+                ocr_text = pytesseract.image_to_string(image, lang='eng', config=config)
+                if len(ocr_text) > max_length:
+                    max_length = len(ocr_text)
+                    best_text = ocr_text
+            except Exception as ocr_error:
+                logger.warning(f"OCR config {config} failed: {str(ocr_error)}")
+                continue
+        
+        return best_text
+    except Exception as e:
+        logger.warning(f"Advanced OCR failed: {str(e)}")
+        return ""
+
+def clean_and_structure_financial_text(text):
+    """Advanced cleaning and structuring for financial text."""
     
-    # Remove excessive line breaks but preserve table structure
-    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+    # Step 1: Fix spacing issues common in financial PDFs
+    text = re.sub(r'([a-zA-Z])([A-Z][a-zA-Z])', r'\1 \2', text)  # Add spaces between camelCase
+    text = re.sub(r'(\d)\s*%', r'\1%', text)  # Fix percentage formatting
+    text = re.sub(r'\$\s*(\d)', r'$\1', text)  # Fix currency formatting
+    text = re.sub(r'\(\s*(\d+[,.]?\d*)\s*\)', r'(\1)', text)  # Fix negative numbers
     
-    # Fix hyphenated words split across lines
-    text = re.sub(r'-\s*\n\s*', '', text)
+    # Step 2: Fix common financial statement patterns
+    text = re.sub(r'(\w+)(\([\d,.]+\))', r'\1 \2', text)  # Space before parenthetical numbers
+    text = re.sub(r'(\d+[,.]\d+)(\w)', r'\1 \2', text)  # Space after numbers before words
     
-    # Clean up excessive spaces but preserve column alignment
-    text = re.sub(r' {3,}', '  ', text)  # Replace 3+ spaces with 2 spaces
+    # Step 3: Preserve important financial terms
+    financial_terms = [
+        'Total Assets', 'Total Liabilities', 'Total Equity', 'Net Income', 'Net Loss',
+        'Gross Profit', 'Operating Income', 'Operating Loss', 'Current Assets',
+        'Non-Current Assets', 'Current Liabilities', 'Long Term Loans',
+        'Retained Earnings', 'Total Sales', 'Cost of Sales', 'Income Statement',
+        'Balance Sheet', 'Cash Flow', 'Profit Loss'
+    ]
     
-    # Fix common OCR errors in financial documents
-    text = re.sub(r'[|]', 'I', text)  # Common OCR mistake
-    text = re.sub(r'(?<=[0-9]),(?=[0-9])', ',', text)  # Fix comma in numbers
-    text = re.sub(r'(?<=[0-9])\.(?=[0-9]{2}\b)', '.', text)  # Fix decimal in currency
+    for term in financial_terms:
+        # Ensure proper spacing around financial terms
+        pattern = re.escape(term).replace(r'\ ', r'\s*')
+        text = re.sub(f'({pattern})', term, text, flags=re.IGNORECASE)
     
-    # Preserve financial formatting patterns
-    # Keep percentage signs attached to numbers
-    text = re.sub(r'(\d+)\s*%', r'\1%', text)
+    # Step 4: Clean excessive whitespace but preserve structure
+    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)  # Max 2 consecutive newlines
+    text = re.sub(r' {3,}', '  ', text)  # Max 2 consecutive spaces
+    text = re.sub(r'\t+', ' ', text)  # Replace tabs with spaces
     
-    # Keep currency symbols attached
-    text = re.sub(r'\$\s*(\d)', r'$\1', text)
-    
-    # Fix negative numbers in parentheses
-    text = re.sub(r'\(\s*(\d+[.,]?\d*)\s*\)', r'(\1)', text)
+    # Step 5: Add structure markers for better chunking
+    text = re.sub(r'\n(Balance Sheet|Income Statement|Statement of|Cash Flow)', r'\n\n=== \1 ===\n', text, flags=re.IGNORECASE)
     
     return text.strip()
 
-def extract_text_with_tables(file_content):
-    """Enhanced PDF text extraction optimized for financial documents with tables."""
+def extract_text_comprehensive(file_content):
+    """Comprehensive text extraction using multiple methods."""
     try:
         # Convert BytesIO to bytes for PyMuPDF
         if hasattr(file_content, 'getvalue'):
@@ -267,231 +380,251 @@ def extract_text_with_tables(file_content):
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
         all_text = ""
-        pages_with_ocr = 0
-        total_chars_extracted = 0
+        extraction_stats = {
+            'direct': 0,
+            'layout': 0,
+            'coordinate': 0,
+            'table': 0,
+            'ocr': 0
+        }
         
-        logger.info(f"Processing PDF with {len(doc)} pages")
+        logger.info(f"Processing PDF with {len(doc)} pages using comprehensive extraction")
         
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
             logger.info(f"Processing page {page_num + 1}")
             
-            # Method 1: Try direct text extraction first
-            page_text = page.get_text()
+            page_texts = {}
             
-            # Method 2: Try text extraction with layout preservation 
-            if len(page_text.strip()) < 100:
-                logger.info(f"Page {page_num + 1}: Trying layout-preserved extraction...")
-                page_text = page.get_text("text", flags=fitz.TEXTFLAGS_DICT)
+            # Method 1: Direct text extraction
+            try:
+                direct_text = page.get_text()
+                page_texts['direct'] = direct_text
+                extraction_stats['direct'] += len(direct_text)
+                logger.info(f"Page {page_num + 1} - Direct: {len(direct_text)} chars")
+            except Exception as e:
+                logger.warning(f"Direct extraction failed: {str(e)}")
+                page_texts['direct'] = ""
             
-            # Method 3: Extract tables specifically
-            if len(page_text.strip()) < 100:
-                logger.info(f"Page {page_num + 1}: Trying table extraction...")
-                try:
-                    tables = page.find_tables()
-                    table_text = ""
-                    for table in tables:
-                        df = table.extract()
-                        for row in df:
-                            table_text += " | ".join([str(cell) if cell else "" for cell in row]) + "\n"
-                    if len(table_text.strip()) > len(page_text.strip()):
-                        page_text = table_text
-                        logger.info(f"Page {page_num + 1}: Table extraction successful")
-                except Exception as table_error:
-                    logger.warning(f"Table extraction failed for page {page_num + 1}: {str(table_error)}")
+            # Method 2: Layout-aware extraction
+            try:
+                layout_text = extract_with_layout_analysis(page)
+                page_texts['layout'] = layout_text
+                extraction_stats['layout'] += len(layout_text)
+                logger.info(f"Page {page_num + 1} - Layout: {len(layout_text)} chars")
+            except Exception as e:
+                logger.warning(f"Layout extraction failed: {str(e)}")
+                page_texts['layout'] = ""
             
-            # Method 4: OCR as last resort
-            if len(page_text.strip()) < 100:
-                logger.info(f"Page {page_num + 1}: Using OCR (direct extraction got {len(page_text.strip())} chars)")
+            # Method 3: Coordinate-based extraction (good for tables)
+            try:
+                coord_text = extract_with_coordinates(page)
+                page_texts['coordinate'] = coord_text
+                extraction_stats['coordinate'] += len(coord_text)
+                logger.info(f"Page {page_num + 1} - Coordinate: {len(coord_text)} chars")
+            except Exception as e:
+                logger.warning(f"Coordinate extraction failed: {str(e)}")
+                page_texts['coordinate'] = ""
+            
+            # Method 4: Table extraction
+            try:
+                tables = page.find_tables()
+                table_text = ""
+                for table in tables:
+                    df = table.extract()
+                    for row in df:
+                        row_text = " | ".join([str(cell) if cell else "" for cell in row])
+                        table_text += row_text + "\n"
+                page_texts['table'] = table_text
+                extraction_stats['table'] += len(table_text)
+                logger.info(f"Page {page_num + 1} - Table: {len(table_text)} chars")
+            except Exception as e:
+                logger.warning(f"Table extraction failed: {str(e)}")
+                page_texts['table'] = ""
+            
+            # Method 5: OCR as backup
+            try:
+                ocr_text = extract_with_advanced_ocr(page, file_content)
+                page_texts['ocr'] = ocr_text
+                extraction_stats['ocr'] += len(ocr_text)
+                logger.info(f"Page {page_num + 1} - OCR: {len(ocr_text)} chars")
+            except Exception as e:
+                logger.warning(f"OCR extraction failed: {str(e)}")
+                page_texts['ocr'] = ""
+            
+            # Choose the best extraction method for this page
+            best_method = 'direct'
+            best_length = len(page_texts['direct'])
+            
+            for method, text in page_texts.items():
+                if len(text) > best_length:
+                    best_length = len(text)
+                    best_method = method
+            
+            # Combine methods if beneficial
+            if best_length < 200:  # If best method is still poor, try combining
+                combined_text = ""
+                for method in ['table', 'coordinate', 'layout', 'direct', 'ocr']:
+                    if page_texts[method] and len(page_texts[method]) > 50:
+                        combined_text += f"\n--- {method.upper()} EXTRACTION ---\n"
+                        combined_text += page_texts[method] + "\n"
                 
-                try:
-                    # Convert page to high-resolution image for better OCR
-                    pix = page.get_pixmap(matrix=fitz.Matrix(3.0, 3.0))  # 3x resolution for financial docs
-                    img_data = pix.tobytes("png")
-                    
-                    # Use OCR with specific config for financial documents
-                    image = Image.open(io.BytesIO(img_data))
-                    
-                    # OCR config optimized for financial documents
-                    custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .,()$%-'
-                    ocr_text = pytesseract.image_to_string(image, lang='eng', config=custom_config)
-                    
-                    if len(ocr_text.strip()) > len(page_text.strip()):
-                        page_text = ocr_text
-                        pages_with_ocr += 1
-                        logger.info(f"Page {page_num + 1}: OCR extracted {len(ocr_text.strip())} characters")
-                    else:
-                        logger.info(f"Page {page_num + 1}: Direct extraction was better")
-                        
-                except Exception as ocr_error:
-                    logger.warning(f"OCR failed for page {page_num + 1}: {str(ocr_error)}")
+                if len(combined_text) > best_length:
+                    best_method = 'combined'
+                    page_texts['combined'] = combined_text
+                    best_length = len(combined_text)
             
-            # Add page separator and content
-            page_chars = len(page_text.strip())
-            total_chars_extracted += page_chars
-            logger.info(f"Page {page_num + 1}: Extracted {page_chars} characters")
+            chosen_text = page_texts.get(best_method, page_texts['direct'])
             
-            all_text += f"\n=== PAGE {page_num + 1} ===\n"
-            all_text += page_text + "\n"
+            logger.info(f"Page {page_num + 1}: Using {best_method} extraction ({len(chosen_text)} chars)")
+            
+            all_text += f"\n=== PAGE {page_num + 1} ({best_method.upper()}) ===\n"
+            all_text += chosen_text + "\n"
         
         doc.close()
         
-        logger.info(f"OCR used on {pages_with_ocr} out of {len(doc)} pages")
-        logger.info(f"Total characters extracted: {total_chars_extracted}")
+        logger.info(f"Extraction stats: {extraction_stats}")
         
-        # Clean up the text for financial documents
-        cleaned_text = clean_financial_text(all_text)
-        logger.info(f"Final cleaned text length: {len(cleaned_text)} characters")
+        # Clean and structure the text
+        cleaned_text = clean_and_structure_financial_text(all_text)
+        logger.info(f"Final text length: {len(cleaned_text)} characters")
         
-        if len(cleaned_text) < 500:  # Very low for an 8-page financial document
-            logger.error("Text extraction yielded very little content - possible extraction failure")
-            
         return cleaned_text
         
     except Exception as e:
-        logger.error(f"Error in enhanced text extraction: {str(e)}")
-        # Fallback to basic extraction
-        logger.info("Falling back to basic PDF extraction...")
+        logger.error(f"Comprehensive extraction failed: {str(e)}")
+        # Ultimate fallback
         return extract_text_from_pdf_fallback(file_content)
 
 def extract_text_from_pdf_fallback(file_content):
-    """Fallback to original pypdf extraction method."""
+    """Ultimate fallback using pypdf."""
     try:
         from pypdf import PdfReader
-        file_content.seek(0)  # Reset file pointer
+        file_content.seek(0)
         reader = PdfReader(file_content)
         text = ""
         for i, page in enumerate(reader.pages):
             page_text = page.extract_text()
             if page_text:
-                text += f"\n=== PAGE {i + 1} ===\n"
+                text += f"\n=== PAGE {i + 1} (FALLBACK) ===\n"
                 text += page_text + "\n"
-        logger.info(f"Fallback extraction got {len(text)} characters")
+        logger.info(f"Fallback extraction: {len(text)} characters")
         return text
     except Exception as e:
-        logger.error(f"Fallback extraction also failed: {str(e)}")
+        logger.error(f"Even fallback extraction failed: {str(e)}")
         return ""
 
 def extract_text_from_pdf(file_content):
-    """Main PDF text extraction function optimized for financial documents."""
-    return extract_text_with_tables(file_content)
+    """Main PDF text extraction function."""
+    return extract_text_comprehensive(file_content)
 
-def chunk_financial_document(text):
-    """Intelligent chunking specifically designed for financial documents."""
+def intelligent_financial_chunking(text):
+    """Advanced chunking for financial documents with context preservation."""
     try:
-        # For financial documents, we want larger chunks to preserve context
-        base_chunk_size = 2000  # Increased from 1000
-        chunk_overlap = 300     # Increased overlap
+        chunk_size = 3000  # Larger chunks for financial context
+        chunk_overlap = 500  # Substantial overlap
         
-        # Split by page markers first
-        pages = text.split('=== PAGE')
+        # Split by major sections first
+        sections = re.split(r'\n=== (PAGE \d+|Balance Sheet|Income Statement|Statement of|Cash Flow)', text)
         
         chunks = []
         current_chunk = ""
         
-        for page_section in pages:
-            if not page_section.strip():
+        for i, section in enumerate(sections):
+            if not section.strip():
                 continue
-                
-            page_section = page_section.strip()
             
-            # For financial documents, try to keep related sections together
-            # Split by major sections (Balance Sheet, Income Statement, etc.)
-            major_sections = re.split(r'\n(?=(?:Balance Sheet|Income Statement|Cash Flow|Statement of|Assets|Liabilities|Equity)\b)', 
-                                    page_section, flags=re.IGNORECASE)
+            # If this is a section header, include it
+            if i > 0 and re.match(r'(PAGE \d+|Balance Sheet|Income Statement|Statement of|Cash Flow)', section):
+                section = f"\n=== {section} ===\n"
             
-            for section in major_sections:
-                section = section.strip()
-                if not section:
-                    continue
-                
-                # If adding this section would exceed chunk size
-                if len(current_chunk) + len(section) > base_chunk_size:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                        
-                        # Create overlap from the end of current chunk
-                        if chunk_overlap > 0:
-                            words = current_chunk.split()
-                            overlap_words = []
-                            char_count = 0
-                            for word in reversed(words):
-                                if char_count + len(word) <= chunk_overlap:
-                                    overlap_words.insert(0, word)
-                                    char_count += len(word) + 1
-                                else:
-                                    break
-                            current_chunk = " ".join(overlap_words) if overlap_words else ""
-                        else:
-                            current_chunk = ""
+            # Check if adding this section exceeds chunk size
+            if len(current_chunk) + len(section) > chunk_size:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
                     
-                    # If section itself is too large, split it further
-                    if len(section) > base_chunk_size:
-                        # Split by paragraphs or table rows
-                        lines = section.split('\n')
-                        temp_chunk = current_chunk
+                    # Create meaningful overlap
+                    if chunk_overlap > 0:
+                        lines = current_chunk.split('\n')
+                        overlap_lines = []
+                        char_count = 0
                         
-                        for line in lines:
-                            if len(temp_chunk) + len(line) + 1 <= base_chunk_size:
-                                temp_chunk = temp_chunk + "\n" + line if temp_chunk else line
+                        for line in reversed(lines):
+                            if char_count + len(line) <= chunk_overlap:
+                                overlap_lines.insert(0, line)
+                                char_count += len(line) + 1
                             else:
-                                if temp_chunk:
-                                    chunks.append(temp_chunk.strip())
-                                temp_chunk = line
+                                break
                         
-                        current_chunk = temp_chunk
+                        current_chunk = '\n'.join(overlap_lines) if overlap_lines else ""
                     else:
-                        current_chunk = current_chunk + "\n\n" + section if current_chunk else section
+                        current_chunk = ""
+                
+                # Handle oversized sections
+                if len(section) > chunk_size:
+                    # Split by paragraphs or lines
+                    lines = section.split('\n')
+                    temp_chunk = current_chunk
+                    
+                    for line in lines:
+                        if len(temp_chunk) + len(line) + 1 <= chunk_size:
+                            temp_chunk = temp_chunk + '\n' + line if temp_chunk else line
+                        else:
+                            if temp_chunk:
+                                chunks.append(temp_chunk.strip())
+                            temp_chunk = line
+                    
+                    current_chunk = temp_chunk
                 else:
-                    # Add section to current chunk
-                    current_chunk = current_chunk + "\n\n" + section if current_chunk else section
+                    current_chunk = current_chunk + section if current_chunk else section
+            else:
+                current_chunk = current_chunk + section if current_chunk else section
         
-        # Add the last chunk
+        # Add final chunk
         if current_chunk:
             chunks.append(current_chunk.strip())
         
-        # Filter out very small chunks and log details
-        meaningful_chunks = []
+        # Filter and validate chunks
+        valid_chunks = []
         for i, chunk in enumerate(chunks):
-            if len(chunk.strip()) >= 100:  # Minimum meaningful size
-                meaningful_chunks.append(chunk)
-                logger.info(f"Chunk {len(meaningful_chunks)}: {len(chunk)} characters")
+            if len(chunk.strip()) >= 200:  # Minimum meaningful size for financial data
+                valid_chunks.append(chunk)
+                logger.info(f"Chunk {len(valid_chunks)}: {len(chunk)} characters")
             else:
-                logger.info(f"Skipping small chunk {i}: {len(chunk)} characters")
+                logger.info(f"Skipped small chunk {i}: {len(chunk)} characters")
         
-        logger.info(f"Created {len(meaningful_chunks)} meaningful chunks from {len(chunks)} total chunks")
+        logger.info(f"Created {len(valid_chunks)} financial chunks")
         
-        if len(meaningful_chunks) == 0:
-            logger.error("No meaningful chunks created - falling back to simple chunking")
+        if not valid_chunks:
+            logger.error("No valid chunks created - using fallback")
             return simple_chunking_fallback(text)
-            
-        return meaningful_chunks
+        
+        return valid_chunks
         
     except Exception as e:
-        logger.error(f"Error in financial document chunking: {str(e)}")
-        # Fallback to simple chunking
+        logger.error(f"Financial chunking failed: {str(e)}")
         return simple_chunking_fallback(text)
 
 def simple_chunking_fallback(text):
-    """Simple fallback chunking method with larger chunks for financial docs."""
-    chunk_size = 2000  # Larger chunks for financial documents
-    chunk_overlap = 300
+    """Simple fallback chunking with larger sizes for financial docs."""
+    chunk_size = 3000
+    chunk_overlap = 500
     
     chunks = []
     for i in range(0, len(text), chunk_size - chunk_overlap):
         chunk = text[i:i + chunk_size]
-        if chunk.strip() and len(chunk.strip()) >= 100:
+        if chunk.strip() and len(chunk.strip()) >= 200:
             chunks.append(chunk)
     
-    logger.info(f"Fallback chunking created {len(chunks)} chunks")
+    logger.info(f"Fallback chunking: {len(chunks)} chunks")
     return chunks
 
 def split_text_into_chunks(text):
-    """Main text chunking function for financial documents."""
-    return chunk_financial_document(text)
+    """Main chunking function."""
+    return intelligent_financial_chunking(text)
 
 def process_document(doc_info):
-    """Process a document from Google Drive."""
+    """Process a document from Google Drive with comprehensive extraction."""
     try:
         logger.info(f"Processing document: {doc_info['file_name']} (ID: {doc_info['id']})")
         
@@ -511,28 +644,38 @@ def process_document(doc_info):
         # Download file from Google Drive
         file_content = download_file_from_drive(drive_service, doc_info["drive_file_id"])
         
-        # Extract text from PDF using enhanced method
+        # Extract text using comprehensive method
         text = extract_text_from_pdf(file_content)
-        logger.info(f"Extracted {len(text)} characters of text from {doc_info['file_name']}")
+        logger.info(f"Extracted {len(text)} characters from {doc_info['file_name']}")
         
-        if len(text) < 100:  # Very low threshold
-            logger.error(f"Very little text extracted from {doc_info['file_name']}")
-            update_document_status(doc_info["id"], "error", "Insufficient text could be extracted from the PDF")
+        if len(text) < 500:  # Still too low for an 8-page financial document
+            logger.error(f"Insufficient text extracted from {doc_info['file_name']}: {len(text)} characters")
+            update_document_status(doc_info["id"], "error", f"Only {len(text)} characters extracted - likely extraction failure")
             return False
         
-        # Split text into chunks using improved method
+        # Split text into chunks
         chunks = split_text_into_chunks(text)
-        logger.info(f"Split text into {len(chunks)} chunks")
+        logger.info(f"Created {len(chunks)} chunks")
         
         if len(chunks) == 0:
             logger.error(f"No chunks generated from {doc_info['file_name']}")
-            update_document_status(doc_info["id"], "error", "No chunks could be generated from the PDF text")
+            update_document_status(doc_info["id"], "error", "No chunks could be generated")
             return False
         
-        # Log chunk sizes for debugging
+        # Log detailed chunk analysis
         total_chunk_chars = sum(len(chunk) for chunk in chunks)
-        logger.info(f"Total characters in chunks: {total_chunk_chars}")
-        logger.info(f"Average chunk size: {total_chunk_chars // len(chunks)}")
+        avg_chunk_size = total_chunk_chars // len(chunks)
+        logger.info(f"Chunk analysis: {len(chunks)} chunks, {total_chunk_chars} total chars, {avg_chunk_size} avg size")
+        
+        # Validate chunk quality
+        financial_chunks = 0
+        for chunk in chunks:
+            has_numbers = bool(re.search(r'\d+[,.]\d+', chunk))
+            has_financial_terms = bool(re.search(r'(income|loss|profit|asset|liability|equity|revenue|expense)', chunk, re.IGNORECASE))
+            if has_numbers and has_financial_terms:
+                financial_chunks += 1
+        
+        logger.info(f"Quality check: {financial_chunks}/{len(chunks)} chunks contain financial data")
         
         # Create document record in database
         conn = get_postgres_connection()
@@ -556,12 +699,12 @@ def process_document(doc_info):
                         doc_info["subclass"],
                         doc_info["drive_file_id"],
                         len(chunks),
-                        True  # Assuming all new documents are marked as new
+                        True
                     )
                 )
                 document_id = cursor.fetchone()[0]
                 
-                # Update the document_tracking table with document_id
+                # Update tracking table
                 cursor.execute(
                     """
                     UPDATE ai_data.document_tracking
@@ -596,20 +739,19 @@ def process_document(doc_info):
                             doc_info["subclass"],
                             document_id,
                             doc_info["drive_file_id"],
-                            embedding.tolist()  # Convert numpy array to list for PostgreSQL
+                            embedding.tolist()
                         )
                     )
                 
                 conn.commit()
-                logger.info(f"Successfully processed document {doc_info['file_name']} with {len(chunks)} chunks")
+                logger.info(f"Successfully processed {doc_info['file_name']}: {len(chunks)} chunks, {total_chunk_chars} chars, {financial_chunks} financial chunks")
                 
-                # Update document status to 'processed'
                 update_document_status(doc_info["id"], "processed")
                 return True
                 
         except Exception as e:
             conn.rollback()
-            logger.error(f"Error processing document: {str(e)}")
+            logger.error(f"Database error processing document: {str(e)}")
             update_document_status(doc_info["id"], "error", str(e))
             return False
         finally:
@@ -622,14 +764,12 @@ def process_document(doc_info):
 
 def process_pending_documents():
     """Process all pending documents."""
-    # Get pending documents (just one at a time to avoid timeouts)
     pending_docs = get_pending_documents()
     logger.info(f"Found {len(pending_docs)} pending documents")
     
     documents_processed = 0
     errors = 0
     
-    # Process each document
     for doc in pending_docs:
         success = process_document(doc)
         if success:
@@ -652,10 +792,9 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-type', 'application/json')
         self.end_headers()
         
-        # Don't load the model on health checks to avoid timeouts
         response = {
             "status": "healthy",
-            "service": "postgres-embeddings-service",
+            "service": "advanced-financial-document-processor",
             "database_connected": True,
             "model_loaded": model is not None
         }
@@ -667,10 +806,8 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
         logger.info(f"Received POST request to {self.path}")
         
         try:
-            # Process pending documents
             results = process_pending_documents()
             
-            # Send response
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -698,15 +835,13 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
 def run_server():
     """Run the HTTP server."""
     try:
-        # Print startup message
-        logger.info("Starting financial document processor service")
+        logger.info("Starting Advanced Financial Document Processor")
         logger.info(f"Python version: {sys.version}")
         logger.info(f"Working directory: {os.getcwd()}")
-        logger.info(f"Environment variables: PORT={PORT}, PG_HOST={PG_HOST}, PG_DATABASE={PG_DATABASE}")
+        logger.info(f"Environment: PORT={PORT}, PG_HOST={PG_HOST}, PG_DATABASE={PG_DATABASE}")
         
-        # Start the server
         httpd = socketserver.TCPServer(("", PORT), DocumentProcessorHandler)
-        logger.info(f"Server listening on port {PORT}")
+        logger.info(f"Advanced processor listening on port {PORT}")
         httpd.serve_forever()
     except Exception as e:
         logger.error(f"Error starting server: {str(e)}")
