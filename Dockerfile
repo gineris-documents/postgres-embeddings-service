@@ -2,11 +2,16 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install any needed system packages
+# Install system packages including Tesseract OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
     libc6-dev \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    libleptonica-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Install numpy first to ensure it's properly built
@@ -24,6 +29,9 @@ COPY document_processor.py .
 RUN touch service-account.json
 
 # Verify installations
-RUN pip list | grep google
+RUN pip list | grep -E "(google|torch|transformers|pymupdf|pytesseract)"
+
+# Test Tesseract installation
+RUN tesseract --version
 
 CMD ["python", "document_processor.py"]
