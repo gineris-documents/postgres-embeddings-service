@@ -219,6 +219,143 @@ def delete_previous_document_data(drive_file_id):
         cursor.close()
         conn.close()
 
+def parse_financial_number(text):
+    """Parse financial number handling negatives and formatting."""
+    if not text:
+        return None
+    
+    # Remove commas and spaces
+    clean_text = re.sub(r'[,\s]', '', text)
+    
+    # Handle parentheses as negative
+    if clean_text.startswith('(') and clean_text.endswith(')'):
+        clean_text = '-' + clean_text[1:-1]
+    
+    # Convert to float
+    try:
+        return float(clean_text)
+    except:
+        return None
+
+def extract_financial_metrics(text):
+    """Extract key financial metrics into structured format."""
+    
+    financial_data = {
+        "company_name": None,
+        "period_end": None,
+        "net_income": None,
+        "total_revenue": None,
+        "total_assets": None,
+        "total_liabilities": None,
+        "total_equity": None,
+        "gross_profit": None,
+        "operating_income": None,
+        "current_assets": None,
+        "current_liabilities": None,
+        "cash_and_equivalents": None,
+        "key_metrics": {}
+    }
+    
+    # Extract company name
+    company_match = re.search(r'([\w\s,]+(?:LLC|Inc|Corp|Corporation))', text, re.IGNORECASE)
+    if company_match:
+        financial_data["company_name"] = company_match.group(1).strip()
+    
+    # Extract period
+    period_match = re.search(r'(?:As of|For the year ended|December 31,?\s*(\d{4}))', text)
+    if period_match:
+        financial_data["period_end"] = period_match.group(1)
+    
+    # Extract Net Income (multiple patterns to catch all variations)
+    net_income_patterns = [
+        r'Net Income[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        r'Current Year Earnings[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        r'Net Income \(Loss\)[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        r'Total Comprehensive Income[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        r'Profit \(Loss\) Before Tax[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?'
+    ]
+    
+    for pattern in net_income_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            if not financial_data["net_income"]:
+                # Look for the pattern with context to get the right number
+                context = text[max(0, match.start()-50):match.end()+50]
+                if '2024' in context or 'current' in context.lower():
+                    value = parse_financial_number(match.group(1))
+                    if value is not None:
+                        financial_data["net_income"] = value
+                        logger.info(f"Found Net Income: {value} using pattern: {pattern}")
+                        break
+    
+    # Extract other key metrics
+    metrics_patterns = {
+        "total_sales": r'Total Sales[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "total_revenue": r'Total (?:Income|Revenue)[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "gross_profit": r'Gross Profit[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "total_assets": r'Total Assets[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "total_liabilities": r'Total Liabilities[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "total_equity": r'Total Equity[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "current_assets": r'Total Current Assets[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "current_liabilities": r'Total Current Liabilities[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "cash_equivalents": r'Total Cash and Cash Equivalents[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?',
+        "operating_income": r'Operating Income[^\d\-\(]*[\(\-]?([\d,.\s]+)[\)]?'
+    }
+    
+    for key, pattern in metrics_patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = parse_financial_number(match.group(1))
+            if value is not None:
+                financial_data["key_metrics"][key] = value
+    
+    return financial_data
+
+def create_financial_summary(financial_data):
+    """Create a natural language summary of financial data."""
+    
+    company = financial_data.get("company_name", "The company")
+    period = financial_data.get("period_end", "the period")
+    
+    summary_parts = [f"Financial summary for {company} as of {period}:"]
+    
+    # Net Income - this is the key metric
+    net_income = financial_data.get("net_income")
+    if net_income is not None:
+        if net_income < 0:
+            summary_parts.append(f"Net Loss: ${abs(net_income):,.2f}")
+            summary_parts.append(f"Current Year Earnings: (${abs(net_income):,.2f})")
+            summary_parts.append(f"Net Income (Loss): (${abs(net_income):,.2f})")
+        else:
+            summary_parts.append(f"Net Income: ${net_income:,.2f}")
+            summary_parts.append(f"Current Year Earnings: ${net_income:,.2f}")
+    
+    # Key metrics
+    metrics = financial_data.get("key_metrics", {})
+    
+    if "total_sales" in metrics:
+        summary_parts.append(f"Total Sales: ${metrics['total_sales']:,.2f}")
+    
+    if "gross_profit" in metrics:
+        summary_parts.append(f"Gross Profit: ${metrics['gross_profit']:,.2f}")
+    
+    if "total_assets" in metrics:
+        summary_parts.append(f"Total Assets: ${metrics['total_assets']:,.2f}")
+    
+    if "total_equity" in metrics:
+        equity = metrics['total_equity']
+        if equity < 0:
+            summary_parts.append(f"Total Equity: (${abs(equity):,.2f}) - negative equity")
+        else:
+            summary_parts.append(f"Total Equity: ${equity:,.2f}")
+    
+    # Add ratios if possible
+    if net_income and "total_sales" in metrics and metrics["total_sales"] != 0:
+        margin = (net_income / metrics["total_sales"]) * 100
+        summary_parts.append(f"Net Profit Margin: {margin:.1f}%")
+    
+    return " ".join(summary_parts)
+
 def simple_ocr_extraction(page):
     """Simple, focused OCR for financial documents."""
     try:
@@ -390,7 +527,7 @@ def split_text_into_chunks(text):
     return simple_smart_chunking(text)
 
 def process_document(doc_info):
-    """Process a document - simplified approach."""
+    """Process a document with structured financial data extraction."""
     try:
         logger.info(f"Processing document: {doc_info['file_name']} (ID: {doc_info['id']})")
         
@@ -418,6 +555,13 @@ def process_document(doc_info):
             update_document_status(doc_info["id"], "error", f"Only {len(text)} characters extracted")
             return False
         
+        # NEW: Extract structured financial data
+        financial_data = extract_financial_metrics(text)
+        financial_summary = create_financial_summary(financial_data)
+        
+        logger.info(f"Extracted financial data: {financial_data}")
+        logger.info(f"Generated summary: {financial_summary}")
+        
         # Chunk the text
         chunks = split_text_into_chunks(text)
         
@@ -434,23 +578,24 @@ def process_document(doc_info):
         
         logger.info(f"Quality check: {financial_chunks}/{len(chunks)} chunks contain financial data")
         
-        # Store in database
+        # Store in database with structured data
         conn = get_postgres_connection()
         try:
             with conn.cursor() as cursor:
-                # Insert document
+                # Insert document with new columns
                 cursor.execute(
                     """
                     INSERT INTO ai_data.documents
                     (client_id, document_name, year, month, day, class, subclass, 
-                     drive_file_id, total_chunks, is_new)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     drive_file_id, total_chunks, is_new, full_document_text, financial_summary)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
                         doc_info["client_id"], doc_info["file_name"], doc_info["year"],
                         doc_info["month"], doc_info["day"], doc_info["class"],
-                        doc_info["subclass"], doc_info["drive_file_id"], len(chunks), True
+                        doc_info["subclass"], doc_info["drive_file_id"], len(chunks), 
+                        True, text, financial_summary
                     )
                 )
                 document_id = cursor.fetchone()[0]
@@ -486,6 +631,7 @@ def process_document(doc_info):
                 
                 total_chars = sum(len(chunk) for chunk in chunks)
                 logger.info(f"SUCCESS: {doc_info['file_name']} - {len(chunks)} chunks, {total_chars} chars, {financial_chunks} with financial data")
+                logger.info(f"Financial Summary: {financial_summary}")
                 
                 update_document_status(doc_info["id"], "processed")
                 return True
@@ -535,7 +681,7 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
         
         response = {
             "status": "healthy",
-            "service": "simple-financial-document-processor",
+            "service": "structured-financial-document-processor",
             "database_connected": True,
             "model_loaded": model is not None
         }
@@ -569,11 +715,11 @@ class DocumentProcessorHandler(http.server.SimpleHTTPRequestHandler):
 def run_server():
     """Run the server."""
     try:
-        logger.info("Starting Simple Financial Document Processor")
+        logger.info("Starting Structured Financial Document Processor")
         logger.info(f"Environment: PORT={PORT}, PG_HOST={PG_HOST}")
         
         httpd = socketserver.TCPServer(("", PORT), DocumentProcessorHandler)
-        logger.info(f"Simple processor listening on port {PORT}")
+        logger.info(f"Structured processor listening on port {PORT}")
         httpd.serve_forever()
         
     except Exception as e:
