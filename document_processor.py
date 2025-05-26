@@ -17,9 +17,37 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
-import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
+
+# Try to import enhanced PDF libraries, fallback to basic if not available
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+    logger.info("PyMuPDF (fitz) imported successfully")
+except ImportError as e:
+    PYMUPDF_AVAILABLE = False
+    logger.warning(f"PyMuPDF not available: {e}")
+
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+    logger.info("OCR libraries imported successfully")
+except ImportError as e:
+    OCR_AVAILABLE = False
+    logger.warning(f"OCR libraries not available: {e}")
+
+# Fallback to basic PDF reader
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    try:
+        from PyPDF2 import PdfReader
+        PYPDF_AVAILABLE = True
+    except ImportError:
+        PYPDF_AVAILABLE = False
+        logger.error("No PDF reader library available")
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Set up logging
@@ -87,20 +115,29 @@ def download_file_from_drive(service, file_id):
 
 def init_clients():
     """Initialize GCS, DB, and model clients."""
-    # Initialize GCS client
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(BUCKET_NAME)
-    logger.info(f"Successfully connected to GCS bucket: {BUCKET_NAME}")
-    
-    # Initialize Drive API
-    drive_service = get_drive_service()
-    
-    # Initialize embedding model
-    logger.info("Initializing SentenceTransformer model: all-MiniLM-L6-v2")
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    logger.info("Model initialized successfully")
-    
-    return bucket, drive_service, model
+    try:
+        # Initialize GCS client
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        logger.info(f"Successfully connected to GCS bucket: {BUCKET_NAME}")
+        
+        # Initialize Drive API
+        drive_service = get_drive_service()
+        
+        # Initialize embedding model with timeout handling
+        logger.info("Initializing SentenceTransformer model: all-MiniLM-L6-v2")
+        try:
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Model initialized successfully")
+        except Exception as model_error:
+            logger.error(f"Failed to initialize model: {model_error}")
+            # For debugging, we'll continue without the model for now
+            model = None
+        
+        return bucket, drive_service, model
+    except Exception as e:
+        logger.error(f"Failed to initialize clients: {str(e)}")
+        raise
 
 def get_postgres_connection():
     """Create and return a connection to PostgreSQL."""
@@ -229,9 +266,15 @@ def delete_previous_document_data(drive_file_id):
 
 def extract_text_with_pymupdf(file_content):
     """Extract text using PyMuPDF with OCR fallback."""
+    if not PYMUPDF_AVAILABLE:
+        logger.info("PyMuPDF not available, using fallback method")
+        return extract_text_fallback(file_content)
+    
     try:
         # Open PDF with PyMuPDF
-        pdf_document = fitz.open("pdf", file_content.read())
+        file_content.seek(0)
+        pdf_data = file_content.read()
+        pdf_document = fitz.open("pdf", pdf_data)
         full_text = ""
         page_texts = []
         
@@ -241,8 +284,8 @@ def extract_text_with_pymupdf(file_content):
             # Try direct text extraction first
             page_text = page.get_text()
             
-            # If no text found, try OCR
-            if not page_text.strip():
+            # If no text found and OCR is available, try OCR
+            if not page_text.strip() and OCR_AVAILABLE:
                 logger.info(f"Page {page_num + 1} has no direct text, attempting OCR")
                 try:
                     # Convert page to image
@@ -289,21 +332,24 @@ def clean_extracted_text(text):
 
 def extract_text_fallback(file_content):
     """Fallback text extraction method."""
+    if not PYPDF_AVAILABLE:
+        logger.error("No PDF reader library available")
+        return "", []
+    
     try:
-        from pypdf import PdfReader
         file_content.seek(0)
         reader = PdfReader(file_content)
         text = ""
         page_texts = []
         
-        for page in reader.pages:
+        for i, page in enumerate(reader.pages):
             page_text = page.extract_text()
             if page_text:
                 page_text = clean_extracted_text(page_text)
                 page_texts.append(page_text)
-                text += page_text + "\n"
+                text += f"\n--- Page {i + 1} ---\n{page_text}\n"
         
-        logger.info(f"Fallback extraction got {len(text)} characters")
+        logger.info(f"Fallback extraction got {len(text)} characters from {len(page_texts)} pages")
         return text, page_texts
     except Exception as e:
         logger.error(f"Fallback extraction also failed: {str(e)}")
@@ -437,8 +483,14 @@ def split_text_into_chunks(text):
 def process_document(doc_info, bucket, drive_service, model):
     """Process a document from Google Drive with enhanced text extraction."""
     try:
+        # Check if model is available
+        if model is None:
+            logger.error("Model not available, cannot process embeddings")
+            update_document_status(doc_info["id"], "error", "Embedding model not available")
+            return False
+        
         # Check if this is a replacement document
-        if doc_info["previous_drive_file_id"]:
+        if doc_info.get("previous_drive_file_id"):
             logger.info(f"This is a replacement document for {doc_info['previous_drive_file_id']}")
             delete_previous_document_data(doc_info["previous_drive_file_id"])
         
@@ -487,11 +539,11 @@ def process_document(doc_info, bucket, drive_service, model):
                     (
                         doc_info["client_id"], 
                         doc_info["file_name"],
-                        doc_info["year"],
-                        doc_info["month"],
-                        doc_info["day"],
-                        doc_info["class"],
-                        doc_info["subclass"],
+                        doc_info.get("year"),
+                        doc_info.get("month"),
+                        doc_info.get("day"),
+                        doc_info.get("class"),
+                        doc_info.get("subclass"),
                         doc_info["drive_file_id"],
                         len(chunks),
                         True,  # Assuming all new documents are marked as new
@@ -530,11 +582,11 @@ def process_document(doc_info, bucket, drive_service, model):
                             doc_info["file_name"],
                             i,
                             chunk_text,
-                            doc_info["year"],
-                            doc_info["month"],
-                            doc_info["day"],
-                            doc_info["class"],
-                            doc_info["subclass"],
+                            doc_info.get("year"),
+                            doc_info.get("month"),
+                            doc_info.get("day"),
+                            doc_info.get("class"),
+                            doc_info.get("subclass"),
                             document_id,
                             doc_info["drive_file_id"],
                             embedding.tolist()  # Convert numpy array to list for PostgreSQL
@@ -627,4 +679,19 @@ def run_server():
     server.serve_forever()
 
 if __name__ == "__main__":
+    # Test basic functionality before starting server
+    logger.info("Starting document processor service...")
+    logger.info(f"PyMuPDF available: {PYMUPDF_AVAILABLE}")
+    logger.info(f"OCR available: {OCR_AVAILABLE}")
+    logger.info(f"PyPDF available: {PYPDF_AVAILABLE}")
+    
+    # Test database connection
+    try:
+        conn = get_postgres_connection()
+        conn.close()
+        logger.info("Database connection test successful")
+    except Exception as e:
+        logger.error(f"Database connection test failed: {e}")
+    
+    # Start server
     run_server()
