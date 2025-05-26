@@ -1,30 +1,61 @@
 import os
 import json
 import time
-import logging
 import io
 import re
 import numpy as np
 import http.server
 import socketserver
-from google.cloud import storage
-from sentence_transformers import SentenceTransformer
-import psycopg2
-import psycopg2.extras
-import google.auth
-from google.auth import default
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from googleapiclient.errors import HttpError
+
+# Set up logging first, before other imports
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Test basic imports first
+try:
+    from google.cloud import storage
+    logger.info("Google Cloud Storage imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import Google Cloud Storage: {e}")
+
+try:
+    from sentence_transformers import SentenceTransformer
+    logger.info("SentenceTransformers imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import SentenceTransformers: {e}")
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    logger.info("PostgreSQL libraries imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import PostgreSQL libraries: {e}")
+
+try:
+    import google.auth
+    from google.auth import default
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.errors import HttpError
+    logger.info("Google API libraries imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import Google API libraries: {e}")
 
 # Try to import enhanced PDF libraries, fallback to basic if not available
+PYMUPDF_AVAILABLE = False
+OCR_AVAILABLE = False
+PYPDF_AVAILABLE = False
+
 try:
     import fitz  # PyMuPDF
     PYMUPDF_AVAILABLE = True
     logger.info("PyMuPDF (fitz) imported successfully")
 except ImportError as e:
-    PYMUPDF_AVAILABLE = False
     logger.warning(f"PyMuPDF not available: {e}")
 
 try:
@@ -33,29 +64,26 @@ try:
     OCR_AVAILABLE = True
     logger.info("OCR libraries imported successfully")
 except ImportError as e:
-    OCR_AVAILABLE = False
     logger.warning(f"OCR libraries not available: {e}")
 
 # Fallback to basic PDF reader
 try:
     from pypdf import PdfReader
     PYPDF_AVAILABLE = True
+    logger.info("pypdf imported successfully")
 except ImportError:
     try:
         from PyPDF2 import PdfReader
         PYPDF_AVAILABLE = True
+        logger.info("PyPDF2 imported successfully")
     except ImportError:
-        PYPDF_AVAILABLE = False
         logger.error("No PDF reader library available")
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+try:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    logger.info("LangChain text splitter imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import LangChain: {e}")
 
 # Configuration
 PROJECT_ID = os.environ.get("PROJECT_ID", "pdf-to-pinecone")
@@ -111,32 +139,6 @@ def download_file_from_drive(service, file_id):
         raise
     except Exception as e:
         logger.error(f"Unexpected error downloading file: {str(e)}")
-        raise
-
-def init_clients():
-    """Initialize GCS, DB, and model clients."""
-    try:
-        # Initialize GCS client
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        logger.info(f"Successfully connected to GCS bucket: {BUCKET_NAME}")
-        
-        # Initialize Drive API
-        drive_service = get_drive_service()
-        
-        # Initialize embedding model with timeout handling
-        logger.info("Initializing SentenceTransformer model: all-MiniLM-L6-v2")
-        try:
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Model initialized successfully")
-        except Exception as model_error:
-            logger.error(f"Failed to initialize model: {model_error}")
-            # For debugging, we'll continue without the model for now
-            model = None
-        
-        return bucket, drive_service, model
-    except Exception as e:
-        logger.error(f"Failed to initialize clients: {str(e)}")
         raise
 
 def get_postgres_connection():
@@ -211,58 +213,20 @@ def update_document_status(doc_id, status, error_message=None):
         cursor.close()
         conn.close()
 
-def delete_previous_document_data(drive_file_id):
-    """Delete document and embeddings data for a previous version."""
-    if not drive_file_id:
-        logger.info("No previous document ID provided, skipping deletion")
-        return
+def clean_extracted_text(text):
+    """Clean up extracted text to preserve financial data formatting."""
+    if not text:
+        return ""
     
-    conn = get_postgres_connection()
-    cursor = conn.cursor()
+    # Remove excessive whitespace but preserve line breaks
+    text = re.sub(r' +', ' ', text)  # Multiple spaces to single space
+    text = re.sub(r'\n\s*\n', '\n\n', text)  # Multiple newlines to double newline
     
-    try:
-        # First, get the document ID from the documents table
-        cursor.execute(
-            """
-            SELECT id FROM ai_data.documents 
-            WHERE drive_file_id = %s
-            """,
-            (drive_file_id,)
-        )
-        document_ids = cursor.fetchall()
-        
-        if not document_ids:
-            logger.info(f"No documents found with drive_file_id: {drive_file_id}")
-            return
-        
-        # Delete embeddings for each document
-        for doc_id in document_ids:
-            cursor.execute(
-                """
-                DELETE FROM ai_data.document_embeddings 
-                WHERE document_id = %s OR drive_file_id = %s
-                """,
-                (doc_id[0], drive_file_id)
-            )
-            logger.info(f"Deleted embeddings for document ID {doc_id[0]}")
-        
-        # Delete the document records
-        cursor.execute(
-            """
-            DELETE FROM ai_data.documents 
-            WHERE drive_file_id = %s
-            """,
-            (drive_file_id,)
-        )
-        logger.info(f"Deleted {cursor.rowcount} documents with drive_file_id: {drive_file_id}")
-        
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Error deleting previous document data: {str(e)}")
-    finally:
-        cursor.close()
-        conn.close()
+    # Preserve currency formatting
+    text = re.sub(r'(\d+),\s*(\d{3})', r'\1,\2', text)  # Fix broken thousands separators
+    text = re.sub(r'\$\s+(\d)', r'$\1', text)  # Fix broken dollar signs
+    
+    return text.strip()
 
 def extract_text_with_pymupdf(file_content):
     """Extract text using PyMuPDF with OCR fallback."""
@@ -314,21 +278,6 @@ def extract_text_with_pymupdf(file_content):
         logger.error(f"PyMuPDF extraction failed: {str(e)}")
         # Fallback to basic extraction
         return extract_text_fallback(file_content)
-
-def clean_extracted_text(text):
-    """Clean up extracted text to preserve financial data formatting."""
-    if not text:
-        return ""
-    
-    # Remove excessive whitespace but preserve line breaks
-    text = re.sub(r' +', ' ', text)  # Multiple spaces to single space
-    text = re.sub(r'\n\s*\n', '\n\n', text)  # Multiple newlines to double newline
-    
-    # Preserve currency formatting
-    text = re.sub(r'(\d+),\s*(\d{3})', r'\1,\2', text)  # Fix broken thousands separators
-    text = re.sub(r'\$\s+(\d)', r'$\1', text)  # Fix broken dollar signs
-    
-    return text.strip()
 
 def extract_text_fallback(file_content):
     """Fallback text extraction method."""
@@ -412,14 +361,6 @@ def extract_tax_metrics(text):
         'total_income': [
             r'total income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
             r'gross income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ],
-        'net_income': [
-            r'net income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
-            r'net profit.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ],
-        'tax_owed': [
-            r'tax owed.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
-            r'amount due.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
         ]
     }
     
@@ -449,12 +390,6 @@ def extract_financial_metrics(text):
         'net_income': [
             r'net income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
             r'net profit.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ],
-        'total_assets': [
-            r'total assets.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ],
-        'total_liabilities': [
-            r'total liabilities.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
         ]
     }
     
@@ -473,14 +408,36 @@ def extract_financial_metrics(text):
 
 def split_text_into_chunks(text):
     """Split text into chunks using RecursiveCharacterTextSplitter."""
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    try:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        chunks = text_splitter.split_text(text)
+        return chunks
+    except Exception as e:
+        logger.error(f"Error splitting text into chunks: {e}")
+        # Simple fallback chunking
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for word in words:
+            if current_length + len(word) > 1000 and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_length = len(word)
+            else:
+                current_chunk.append(word)
+                current_length += len(word) + 1
+        
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        return chunks
 
-def process_document(doc_info, bucket, drive_service, model):
+def process_document(doc_info, drive_service, model):
     """Process a document from Google Drive with enhanced text extraction."""
     try:
         # Check if model is available
@@ -488,11 +445,6 @@ def process_document(doc_info, bucket, drive_service, model):
             logger.error("Model not available, cannot process embeddings")
             update_document_status(doc_info["id"], "error", "Embedding model not available")
             return False
-        
-        # Check if this is a replacement document
-        if doc_info.get("previous_drive_file_id"):
-            logger.info(f"This is a replacement document for {doc_info['previous_drive_file_id']}")
-            delete_previous_document_data(doc_info["previous_drive_file_id"])
         
         # Download file from Google Drive
         file_content = download_file_from_drive(drive_service, doc_info["drive_file_id"])
@@ -615,29 +567,54 @@ def process_document(doc_info, bucket, drive_service, model):
 
 def process_pending_documents():
     """Process all pending documents."""
-    bucket, drive_service, model = init_clients()
-    
-    # Get pending documents
-    pending_docs = get_pending_documents()
-    logger.info(f"Found {len(pending_docs)} pending documents")
-    
-    documents_processed = 0
-    errors = 0
-    
-    # Process each document
-    for doc in pending_docs:
-        logger.info(f"Processing document: {doc['file_name']} (ID: {doc['id']})")
-        success = process_document(doc, bucket, drive_service, model)
-        if success:
-            documents_processed += 1
-        else:
-            errors += 1
-    
-    return {
-        "documents_found": len(pending_docs),
-        "documents_processed": documents_processed,
-        "errors": errors
-    }
+    try:
+        # Initialize Drive API
+        drive_service = get_drive_service()
+        
+        # Initialize embedding model with timeout handling
+        logger.info("Initializing SentenceTransformer model: all-MiniLM-L6-v2")
+        model = None
+        try:
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Model initialized successfully")
+        except Exception as model_error:
+            logger.error(f"Failed to initialize model: {model_error}")
+            return {
+                "documents_found": 0,
+                "documents_processed": 0,
+                "errors": 1,
+                "error": "Model initialization failed"
+            }
+        
+        # Get pending documents
+        pending_docs = get_pending_documents()
+        logger.info(f"Found {len(pending_docs)} pending documents")
+        
+        documents_processed = 0
+        errors = 0
+        
+        # Process each document
+        for doc in pending_docs:
+            logger.info(f"Processing document: {doc['file_name']} (ID: {doc['id']})")
+            success = process_document(doc, drive_service, model)
+            if success:
+                documents_processed += 1
+            else:
+                errors += 1
+        
+        return {
+            "documents_found": len(pending_docs),
+            "documents_processed": documents_processed,
+            "errors": errors
+        }
+    except Exception as e:
+        logger.error(f"Error in process_pending_documents: {str(e)}")
+        return {
+            "documents_found": 0,
+            "documents_processed": 0,
+            "errors": 1,
+            "error": str(e)
+        }
 
 class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -645,14 +622,19 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
         self.end_headers()
-        response = {'status': 'healthy'}
+        response = {'status': 'healthy', 'capabilities': {
+            'pymupdf': PYMUPDF_AVAILABLE,
+            'ocr': OCR_AVAILABLE,
+            'pypdf': PYPDF_AVAILABLE
+        }}
         self.wfile.write(json.dumps(response).encode('utf-8'))
     
     def do_POST(self):
         """Handle POST requests - for document processing."""
         try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                post_data = self.rfile.read(content_length)
             
             # Process documents
             results = process_pending_documents()
@@ -674,24 +656,32 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 def run_server():
     """Run the HTTP server."""
     port = int(os.environ.get('PORT', 8080))
-    server = socketserver.TCPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    logger.info(f'Starting server on port {port}')
-    server.serve_forever()
+    
+    try:
+        server = socketserver.TCPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+        logger.info(f'Starting server on port {port}')
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        raise
 
 if __name__ == "__main__":
     # Test basic functionality before starting server
-    logger.info("Starting document processor service...")
+    logger.info("=== Starting document processor service ===")
     logger.info(f"PyMuPDF available: {PYMUPDF_AVAILABLE}")
     logger.info(f"OCR available: {OCR_AVAILABLE}")
     logger.info(f"PyPDF available: {PYPDF_AVAILABLE}")
     
     # Test database connection
     try:
+        logger.info("Testing database connection...")
         conn = get_postgres_connection()
         conn.close()
         logger.info("Database connection test successful")
     except Exception as e:
         logger.error(f"Database connection test failed: {e}")
+        # Don't exit - service should still start for health checks
     
     # Start server
+    logger.info("Starting HTTP server...")
     run_server()
