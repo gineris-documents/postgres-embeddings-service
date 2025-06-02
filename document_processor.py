@@ -527,7 +527,7 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
             conn = get_postgres_connection()
             try:
                 with conn.cursor() as cursor:
-                    # Check if document exists in ai_data.documents
+                    # Check if document exists in ai_data.documents and get its ID
                     cursor.execute(
                         """
                         SELECT id FROM ai_data.documents 
@@ -538,15 +538,18 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                     
                     doc_row = cursor.fetchone()
                     
+                    test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
+                    test_financial = json.dumps({
+                        "test": "vision_api_working", 
+                        "page_1_analysis": str(test_analysis)[:200],
+                        "model_used": test_analysis.get("model_used", "unknown"),
+                        "timestamp": time.time()
+                    })
+                    
                     if doc_row:
                         # Update existing document
-                        test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
-                        test_financial = json.dumps({
-                            "test": "vision_api_working", 
-                            "page_1_analysis": str(test_analysis)[:200],
-                            "model_used": test_analysis.get("model_used", "unknown"),
-                            "timestamp": time.time()
-                        })
+                        document_id = doc_row[0]
+                        logger.info(f"Found existing document with ID: {document_id}")
                         
                         cursor.execute(
                             """
@@ -564,29 +567,23 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                         rows_updated = cursor.rowcount
                         logger.info(f"✓ Database UPDATE: {rows_updated} rows updated")
                     else:
-                        # Insert new document
+                        # Insert new document and get its ID
                         logger.info("Document not found in ai_data.documents, inserting new record...")
-                        
-                        test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
-                        test_financial = json.dumps({
-                            "test": "vision_api_working", 
-                            "page_1_analysis": str(test_analysis)[:200],
-                            "model_used": test_analysis.get("model_used", "unknown"),
-                            "timestamp": time.time()
-                        })
                         
                         cursor.execute(
                             """
                             INSERT INTO ai_data.documents 
                             (drive_file_id, full_document_text, financial_summary, vision_analysis, total_chunks, processed_at)
                             VALUES (%s, %s, %s, %s, %s, NOW())
+                            RETURNING id
                             """,
                             (doc_info["drive_file_id"], test_summary, test_financial, json.dumps(test_analysis), len(images))
                         )
                         
-                        logger.info("✓ New document inserted into ai_data.documents")
+                        document_id = cursor.fetchone()[0]
+                        logger.info(f"✓ New document inserted with ID: {document_id}")
                     
-                    # Clean up old embeddings and insert test embedding
+                    # Clean up old embeddings and insert test embedding with correct document_id
                     cursor.execute(
                         """
                         DELETE FROM ai_data.document_embeddings 
@@ -612,7 +609,7 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                             doc_info.get("day", 1),
                             doc_info.get("class", "financial"),
                             doc_info.get("subclass", "statement"),
-                            doc_info.get("document_id", 20),
+                            document_id,  # Use the actual document ID instead of hardcoded 20
                             doc_info["drive_file_id"],
                             [0.0] * 384  # Dummy embedding vector
                         )
