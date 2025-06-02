@@ -331,6 +331,14 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
         logger.info(f"Using prompt: {prompt[:100]}...")
         logger.info("Calling OpenAI Vision API...")
         
+        # Simple direct API call without client initialization issues
+        import requests
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
         # Try gpt-4o first (newer model), fallback to gpt-4-vision-preview
         models_to_try = ["gpt-4o", "gpt-4-vision-preview"]
         
@@ -338,10 +346,9 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
             try:
                 logger.info(f"Trying model: {model_name}")
                 
-                # Use the stable 0.28 interface
-                response = openai.ChatCompletion.create(
-                    model=model_name,
-                    messages=[
+                payload = {
+                    "model": model_name,
+                    "messages": [
                         {
                             "role": "user",
                             "content": [
@@ -356,22 +363,35 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                             ]
                         }
                     ],
-                    max_tokens=1000,
-                    temperature=0.1
+                    "max_tokens": 1000,
+                    "temperature": 0.1
+                }
+                
+                response = requests.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=60
                 )
                 
-                logger.info(f"✓ Vision API call successful with {model_name}")
-                break  # Success, exit the loop
-                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result['choices'][0]['message']['content']
+                    logger.info(f"✓ Vision API call successful with {model_name}")
+                    logger.info(f"Received response: {len(content)} characters")
+                    break
+                else:
+                    error_msg = f"HTTP {response.status_code}: {response.text}"
+                    logger.error(f"✗ Model {model_name} failed: {error_msg}")
+                    if model_name == models_to_try[-1]:
+                        raise Exception(error_msg)
+                    continue
+                    
             except Exception as model_error:
                 logger.error(f"✗ Model {model_name} failed: {str(model_error)}")
                 if model_name == models_to_try[-1]:  # Last model, re-raise error
                     raise model_error
                 continue  # Try next model
-        
-        # Parse the response (0.28 interface)
-        content = response['choices'][0]['message']['content']
-        logger.info(f"Received response: {len(content)} characters")
         
         # Try to parse as JSON, fallback to text if not valid JSON
         try:
@@ -664,17 +684,35 @@ if __name__ == "__main__":
         try:
             logger.info("Testing OpenAI API connection...")
             
-            # Use the stable 0.28 interface
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": "Hello, this is a test. Respond with 'API working'."}],
-                max_tokens=10
+            # Use direct HTTP request to avoid library version issues
+            import requests
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}"
+            }
+            
+            payload = {
+                "model": "gpt-3.5-turbo",
+                "messages": [{"role": "user", "content": "Hello, this is a test. Respond with 'API working'."}],
+                "max_tokens": 10
+            }
+            
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30
             )
             
-            if response['choices'][0]['message']['content']:
-                logger.info("✓ OpenAI API key is working")
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('choices') and result['choices'][0]['message']['content']:
+                    logger.info("✓ OpenAI API key is working")
+                else:
+                    logger.error("✗ OpenAI API returned empty response")
             else:
-                logger.error("✗ OpenAI API returned empty response")
+                logger.error(f"✗ OpenAI API test failed: HTTP {response.status_code} - {response.text}")
                 
         except Exception as api_error:
             logger.error(f"✗ OpenAI API test failed: {str(api_error)}")
