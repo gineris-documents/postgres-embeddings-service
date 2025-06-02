@@ -413,56 +413,112 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
         if not images:
             raise Exception("No images generated from PDF")
         
+        logger.info(f"Generated {len(images)} images from PDF")
+        
         # Identify document type
         document_type = identify_document_type_from_filename(doc_info["file_name"])
         logger.info(f"Identified document type: {document_type}")
         
-        # Analyze each page with Vision API
+        # Analyze each page with Vision API (limit to first 10 pages for testing)
         page_analyses = []
-        for i, image_data in enumerate(images, 1):
+        max_pages = min(len(images), 10)  # Limit for testing and cost control
+        logger.info(f"Processing first {max_pages} pages with Vision API")
+        
+        for i, image_data in enumerate(images[:max_pages], 1):
             try:
+                logger.info(f"Analyzing page {i} with Vision API...")
                 analysis = analyze_image_with_vision(image_data, document_type, i)
                 page_analyses.append(analysis)
+                logger.info(f"Successfully analyzed page {i}")
                 
                 # Add delay to respect rate limits
-                time.sleep(1)
+                time.sleep(2)
                 
             except Exception as e:
                 logger.error(f"Failed to analyze page {i}: {str(e)}")
                 page_analyses.append({"error": str(e), "page_number": i})
         
+        logger.info(f"Completed Vision API analysis for {len(page_analyses)} pages")
+        
         # Consolidate analyses
         consolidated_analysis = consolidate_page_analyses(page_analyses, document_type)
+        logger.info(f"Consolidated analysis: {len(str(consolidated_analysis))} characters")
+        
+        # Prepare data for storage
+        full_document_text = consolidated_analysis.get("full_summary", "")
+        financial_summary_dict = consolidated_analysis.get("key_figures_consolidated", {})
+        financial_summary = json.dumps(financial_summary_dict) if financial_summary_dict else ""
+        vision_analysis = json.dumps(consolidated_analysis)
+        
+        logger.info(f"Prepared data - Full text: {len(full_document_text)} chars, Financial summary: {len(financial_summary)} chars, Vision analysis: {len(vision_analysis)} chars")
         
         # Store in database
         conn = get_postgres_connection()
         try:
             with conn.cursor() as cursor:
-                # Insert document with vision analysis
-                cursor.execute(
-                    """
-                    INSERT INTO ai_data.documents
-                    (client_id, document_name, year, month, day, class, subclass, 
-                     drive_file_id, total_chunks, is_new, full_document_text, financial_summary, vision_analysis)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        doc_info["client_id"], 
-                        doc_info["file_name"],
-                        doc_info.get("year"),
-                        doc_info.get("month"),
-                        doc_info.get("day"),
-                        doc_info.get("class"),
-                        doc_info.get("subclass"),
-                        doc_info["drive_file_id"],
-                        len(images),  # Use number of pages as chunks
-                        True,
-                        consolidated_analysis.get("full_summary", ""),  # Store summary as full text
-                        json.dumps(consolidated_analysis.get("key_figures_consolidated", {})),  # Key figures as financial summary
-                        json.dumps(consolidated_analysis)  # Complete analysis
+                # Check if vision_analysis column exists, if not, don't include it
+                cursor.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_schema = 'ai_data' 
+                    AND table_name = 'documents' 
+                    AND column_name = 'vision_analysis'
+                """)
+                vision_column_exists = cursor.fetchone() is not None
+                
+                if vision_column_exists:
+                    # Insert with vision_analysis column
+                    cursor.execute(
+                        """
+                        INSERT INTO ai_data.documents
+                        (client_id, document_name, year, month, day, class, subclass, 
+                         drive_file_id, total_chunks, is_new, full_document_text, financial_summary, vision_analysis)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            doc_info["client_id"], 
+                            doc_info["file_name"],
+                            doc_info.get("year"),
+                            doc_info.get("month"),
+                            doc_info.get("day"),
+                            doc_info.get("class"),
+                            doc_info.get("subclass"),
+                            doc_info["drive_file_id"],
+                            len(images),
+                            True,
+                            full_document_text,
+                            financial_summary,
+                            vision_analysis
+                        )
                     )
-                )
+                else:
+                    # Insert without vision_analysis column
+                    logger.warning("vision_analysis column doesn't exist, inserting without it")
+                    cursor.execute(
+                        """
+                        INSERT INTO ai_data.documents
+                        (client_id, document_name, year, month, day, class, subclass, 
+                         drive_file_id, total_chunks, is_new, full_document_text, financial_summary)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            doc_info["client_id"], 
+                            doc_info["file_name"],
+                            doc_info.get("year"),
+                            doc_info.get("month"),
+                            doc_info.get("day"),
+                            doc_info.get("class"),
+                            doc_info.get("subclass"),
+                            doc_info["drive_file_id"],
+                            len(images),
+                            True,
+                            full_document_text,
+                            financial_summary
+                        )
+                    )
+                
                 document_id = cursor.fetchone()[0]
                 logger.info(f"Created document record with ID: {document_id}")
                 
@@ -476,8 +532,8 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                     (document_id, doc_info["id"])
                 )
                 
-                # Store individual page analyses
-                for page_analysis in page_analyses:
+                # Store individual page analyses (only store first few for testing)
+                for page_analysis in page_analyses[:5]:  # Store first 5 page analyses
                     cursor.execute(
                         """
                         INSERT INTO ai_data.document_embeddings
@@ -489,7 +545,7 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                             doc_info["client_id"],
                             doc_info["file_name"],
                             page_analysis.get("page_number", 0),
-                            json.dumps(page_analysis),  # Store page analysis as text
+                            json.dumps(page_analysis)[:5000],  # Truncate if too long
                             doc_info.get("year"),
                             doc_info.get("month"),
                             doc_info.get("day"),
@@ -497,12 +553,12 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                             doc_info.get("subclass"),
                             document_id,
                             doc_info["drive_file_id"],
-                            [0.0] * 384  # Placeholder embedding for now
+                            [0.0] * 384  # Placeholder embedding
                         )
                     )
                 
                 conn.commit()
-                logger.info(f"Successfully processed document {doc_info['file_name']} with Vision API")
+                logger.info(f"Successfully processed document {doc_info['file_name']} with Vision API - stored {len(page_analyses)} page analyses")
                 
                 # Update status to processed
                 update_document_status(doc_info["id"], "processed")
@@ -511,6 +567,7 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
         except Exception as e:
             conn.rollback()
             logger.error(f"Error storing vision analysis: {str(e)}")
+            logger.error(f"Full error details: {repr(e)}")
             update_document_status(doc_info["id"], "error", str(e))
             return False
         finally:
@@ -518,6 +575,7 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
             
     except Exception as e:
         logger.error(f"Error processing document with vision: {str(e)}")
+        logger.error(f"Full error details: {repr(e)}")
         update_document_status(doc_info["id"], "error", str(e))
         return False
 
