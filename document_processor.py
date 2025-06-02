@@ -2,32 +2,20 @@ import os
 import json
 import time
 import io
-import re
-import numpy as np
+import logging
+import base64
 import http.server
 import socketserver
+from typing import List, Dict, Any, Optional
 
-# Set up logging first, before other imports
-import logging
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Test basic imports first
-try:
-    from google.cloud import storage
-    logger.info("Google Cloud Storage imported successfully")
-except ImportError as e:
-    logger.error(f"Failed to import Google Cloud Storage: {e}")
-
-try:
-    from sentence_transformers import SentenceTransformer
-    logger.info("SentenceTransformers imported successfully")
-except ImportError as e:
-    logger.error(f"Failed to import SentenceTransformers: {e}")
-
+# Essential imports with error handling
 try:
     import psycopg2
     import psycopg2.extras
@@ -46,50 +34,35 @@ try:
 except ImportError as e:
     logger.error(f"Failed to import Google API libraries: {e}")
 
-# Try to import enhanced PDF libraries, fallback to basic if not available
-PYMUPDF_AVAILABLE = False
-OCR_AVAILABLE = False
-PYPDF_AVAILABLE = False
-
 try:
-    import fitz  # PyMuPDF
+    import fitz  # PyMuPDF for PDF to image conversion
     PYMUPDF_AVAILABLE = True
-    logger.info("PyMuPDF (fitz) imported successfully")
+    logger.info("PyMuPDF imported successfully")
 except ImportError as e:
+    PYMUPDF_AVAILABLE = False
     logger.warning(f"PyMuPDF not available: {e}")
 
 try:
-    import pytesseract
     from PIL import Image
-    OCR_AVAILABLE = True
-    logger.info("OCR libraries imported successfully")
+    PIL_AVAILABLE = True
+    logger.info("PIL imported successfully")
 except ImportError as e:
-    logger.warning(f"OCR libraries not available: {e}")
-
-# Fallback to basic PDF reader
-try:
-    from pypdf import PdfReader
-    PYPDF_AVAILABLE = True
-    logger.info("pypdf imported successfully")
-except ImportError:
-    try:
-        from PyPDF2 import PdfReader
-        PYPDF_AVAILABLE = True
-        logger.info("PyPDF2 imported successfully")
-    except ImportError:
-        logger.error("No PDF reader library available")
+    PIL_AVAILABLE = False
+    logger.warning(f"PIL not available: {e}")
 
 try:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    logger.info("LangChain text splitter imported successfully")
+    import openai
+    OPENAI_AVAILABLE = True
+    logger.info("OpenAI library imported successfully")
 except ImportError as e:
-    logger.error(f"Failed to import LangChain: {e}")
+    OPENAI_AVAILABLE = False
+    logger.error(f"OpenAI library not available: {e}")
 
 # Configuration
 PROJECT_ID = os.environ.get("PROJECT_ID", "pdf-to-pinecone")
-BUCKET_NAME = f"{PROJECT_ID}-chunks"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# PostgreSQL Configuration for Google Cloud SQL
+# PostgreSQL Configuration
 PG_HOST = os.environ.get("PG_HOST", "34.66.180.234")
 PG_DATABASE = os.environ.get("PG_DATABASE", "gineris_dev")
 PG_USER = os.environ.get("PG_USER", "admin")
@@ -99,18 +72,22 @@ PG_PASSWORD = os.environ.get("PG_PASSWORD", "H@nnib@lMO2015")
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service-account.json")
 
+# Initialize OpenAI client
+if OPENAI_AVAILABLE and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+    logger.info("OpenAI API key configured")
+else:
+    logger.error("OpenAI API key not configured or library not available")
+
 def get_drive_service():
     """Create and return a Google Drive service."""
     try:
-        # First try to use service account file
         if os.path.exists(SERVICE_ACCOUNT_FILE) and os.path.getsize(SERVICE_ACCOUNT_FILE) > 0:
             creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
             service = build('drive', 'v3', credentials=creds)
             logger.info("Successfully connected to Google Drive API using service account")
             return service
         else:
-            # Fall back to application default credentials
-            logger.warning(f"Service account file '{SERVICE_ACCOUNT_FILE}' not found or empty, using default credentials")
             credentials, _ = default(scopes=SCOPES)
             service = build('drive', 'v3', credentials=credentials)
             logger.info("Successfully connected to Google Drive API using default credentials")
@@ -134,11 +111,8 @@ def download_file_from_drive(service, file_id):
         file_content.seek(0)
         logger.info(f"Successfully downloaded file with ID: {file_id}")
         return file_content
-    except HttpError as error:
-        logger.error(f"Error downloading file from Google Drive: {error}")
-        raise
     except Exception as e:
-        logger.error(f"Unexpected error downloading file: {str(e)}")
+        logger.error(f"Error downloading file from Google Drive: {str(e)}")
         raise
 
 def get_postgres_connection():
@@ -213,279 +187,237 @@ def update_document_status(doc_id, status, error_message=None):
         cursor.close()
         conn.close()
 
-def clean_extracted_text(text):
-    """Clean up extracted text to preserve financial data formatting."""
-    if not text:
-        return ""
-    
-    # Remove excessive whitespace but preserve line breaks
-    text = re.sub(r' +', ' ', text)  # Multiple spaces to single space
-    text = re.sub(r'\n\s*\n', '\n\n', text)  # Multiple newlines to double newline
-    
-    # Preserve currency formatting
-    text = re.sub(r'(\d+),\s*(\d{3})', r'\1,\2', text)  # Fix broken thousands separators
-    text = re.sub(r'\$\s+(\d)', r'$\1', text)  # Fix broken dollar signs
-    
-    return text.strip()
-
-def extract_text_with_pymupdf(file_content):
-    """Extract text using PyMuPDF with OCR fallback."""
+def pdf_to_images(file_content: io.BytesIO) -> List[bytes]:
+    """Convert PDF to high-quality images using PyMuPDF."""
     if not PYMUPDF_AVAILABLE:
-        logger.info("PyMuPDF not available, using fallback method")
-        return extract_text_fallback(file_content)
+        raise Exception("PyMuPDF not available for PDF to image conversion")
     
     try:
-        # Open PDF with PyMuPDF
         file_content.seek(0)
         pdf_data = file_content.read()
         pdf_document = fitz.open("pdf", pdf_data)
-        full_text = ""
-        page_texts = []
         
+        images = []
         for page_num in range(len(pdf_document)):
             page = pdf_document.load_page(page_num)
             
-            # Try direct text extraction first
-            page_text = page.get_text()
+            # Convert to high-quality image
+            # Use higher DPI for better OCR results
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # 2x scaling for better quality
+            img_data = pix.tobytes("png")
+            images.append(img_data)
             
-            # If no text found and OCR is available, try OCR
-            if not page_text.strip() and OCR_AVAILABLE:
-                logger.info(f"Page {page_num + 1} has no direct text, attempting OCR")
-                try:
-                    # Convert page to image
-                    pix = page.get_pixmap()
-                    img_data = pix.tobytes("png")
-                    image = Image.open(io.BytesIO(img_data))
-                    
-                    # Perform OCR
-                    page_text = pytesseract.image_to_string(image)
-                    logger.info(f"OCR extracted {len(page_text)} characters from page {page_num + 1}")
-                except Exception as ocr_error:
-                    logger.warning(f"OCR failed for page {page_num + 1}: {str(ocr_error)}")
-                    page_text = ""
-            
-            if page_text.strip():
-                # Clean up text spacing and formatting
-                page_text = clean_extracted_text(page_text)
-                page_texts.append(page_text)
-                full_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+            logger.info(f"Converted page {page_num + 1} to image ({len(img_data)} bytes)")
         
         pdf_document.close()
-        logger.info(f"PyMuPDF extracted {len(full_text)} characters from {len(page_texts)} pages")
-        return full_text, page_texts
+        logger.info(f"Successfully converted PDF to {len(images)} images")
+        return images
         
     except Exception as e:
-        logger.error(f"PyMuPDF extraction failed: {str(e)}")
-        # Fallback to basic extraction
-        return extract_text_fallback(file_content)
+        logger.error(f"Error converting PDF to images: {str(e)}")
+        raise
 
-def extract_text_fallback(file_content):
-    """Fallback text extraction method."""
-    if not PYPDF_AVAILABLE:
-        logger.error("No PDF reader library available")
-        return "", []
-    
-    try:
-        file_content.seek(0)
-        reader = PdfReader(file_content)
-        text = ""
-        page_texts = []
-        
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                page_text = clean_extracted_text(page_text)
-                page_texts.append(page_text)
-                text += f"\n--- Page {i + 1} ---\n{page_text}\n"
-        
-        logger.info(f"Fallback extraction got {len(text)} characters from {len(page_texts)} pages")
-        return text, page_texts
-    except Exception as e:
-        logger.error(f"Fallback extraction also failed: {str(e)}")
-        return "", []
-
-def identify_document_type(text, filename):
-    """Identify the type of financial document."""
-    text_lower = text.lower()
+def identify_document_type_from_filename(filename: str) -> str:
+    """Identify document type from filename."""
     filename_lower = filename.lower()
     
-    # Tax return patterns
-    if any(pattern in text_lower for pattern in ['form 1120', '1120-s', 'tax return', 'form 1065', 'schedule k-1']):
+    if any(term in filename_lower for term in ['1120', '1040', '1065', 'tax', 'return']):
         return 'tax_return'
-    
-    # Financial statement patterns
-    if any(pattern in text_lower for pattern in ['balance sheet', 'income statement', 'profit and loss', 'p&l', 'cash flow statement']):
+    elif any(term in filename_lower for term in ['financial', 'statement', 'p&l', 'balance']):
         return 'financial_statement'
-    
-    # Invoice patterns
-    if any(pattern in text_lower for pattern in ['invoice', 'bill to', 'invoice number', 'amount due']):
+    elif any(term in filename_lower for term in ['invoice', 'bill']):
         return 'invoice'
-    
-    # Contract patterns
-    if any(pattern in text_lower for pattern in ['agreement', 'contract', 'terms and conditions', 'whereas']):
+    elif any(term in filename_lower for term in ['contract', 'agreement']):
         return 'contract'
-    
-    # Default based on filename or content
-    if 'tax' in filename_lower:
-        return 'tax_return'
-    elif any(pattern in filename_lower for pattern in ['financial', 'statement', 'p&l', 'income']):
-        return 'financial_statement'
-    
-    return 'unknown'
+    else:
+        return 'unknown'
 
-def extract_financial_summary(text, document_type):
-    """Extract structured financial data based on document type."""
-    summary_data = {
-        'document_type': document_type,
-        'extracted_metrics': {}
-    }
+def get_document_analysis_prompt(document_type: str) -> str:
+    """Get the appropriate prompt for document analysis based on type."""
+    
+    base_prompt = """You are a professional tax and accounting AI assistant. Analyze this document image and extract key financial information.
+
+Please provide a JSON response with the following structure:
+{
+    "document_type": "type of document",
+    "key_figures": {
+        "field_name": "value"
+    },
+    "summary": "brief summary of the document",
+    "notable_items": ["list", "of", "important", "observations"]
+}
+
+"""
     
     if document_type == 'tax_return':
-        summary_data['extracted_metrics'] = extract_tax_metrics(text)
+        return base_prompt + """
+Focus on:
+- Form type (1120, 1120S, 1040, etc.)
+- Tax year
+- Taxpayer name and EIN/SSN
+- Key amounts: Gross income, Taxable income, Tax owed/refund, Net income/loss
+- Schedule information if present
+- Any unusual items or red flags
+"""
+    
     elif document_type == 'financial_statement':
-        summary_data['extracted_metrics'] = extract_financial_metrics(text)
+        return base_prompt + """
+Focus on:
+- Statement type (Income Statement, Balance Sheet, Cash Flow)
+- Period covered
+- Company name
+- Key amounts: Revenue, Net Income, Total Assets, Total Liabilities, Equity
+- Year-over-year changes if comparative
+- Any unusual items or significant variances
+"""
     
-    # Convert to JSON string for storage
-    return json.dumps(summary_data, indent=2)
+    else:
+        return base_prompt + """
+Focus on:
+- Document purpose and type
+- Key parties involved
+- Important dates and amounts
+- Critical terms or conditions
+- Any unusual or notable items
+"""
 
-def extract_tax_metrics(text):
-    """Extract key tax metrics from tax documents."""
-    metrics = {}
+def analyze_image_with_vision(image_data: bytes, document_type: str, page_number: int) -> Dict[str, Any]:
+    """Analyze a single image using OpenAI Vision API."""
+    if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
+        raise Exception("OpenAI not available or API key not configured")
     
-    # Common tax patterns
-    patterns = {
-        'ordinary_business_income': [
-            r'ordinary business income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
-            r'line 22.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ],
-        'total_income': [
-            r'total income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
-            r'gross income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ]
-    }
-    
-    for metric, pattern_list in patterns.items():
-        for pattern in pattern_list:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                try:
-                    # Take the last match (usually the total)
-                    value = matches[-1].replace(',', '')
-                    metrics[metric] = float(value)
-                    break
-                except (ValueError, IndexError):
-                    continue
-    
-    return metrics
-
-def extract_financial_metrics(text):
-    """Extract key financial metrics from financial statements."""
-    metrics = {}
-    
-    patterns = {
-        'revenue': [
-            r'revenue.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
-            r'sales.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ],
-        'net_income': [
-            r'net income.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',
-            r'net profit.*?[\$\(]?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)'
-        ]
-    }
-    
-    for metric, pattern_list in patterns.items():
-        for pattern in pattern_list:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                try:
-                    value = matches[-1].replace(',', '')
-                    metrics[metric] = float(value)
-                    break
-                except (ValueError, IndexError):
-                    continue
-    
-    return metrics
-
-def split_text_into_chunks(text):
-    """Split text into chunks using RecursiveCharacterTextSplitter."""
     try:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
+        # Encode image to base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # Get appropriate prompt
+        prompt = get_document_analysis_prompt(document_type)
+        
+        # Add page context
+        if page_number > 1:
+            prompt += f"\n\nThis is page {page_number} of the document. Focus on the content visible on this specific page."
+        
+        response = openai.chat.completions.create(
+            model="gpt-4-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}",
+                                "detail": "high"  # Use high detail for better analysis
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000,
+            temperature=0.1  # Low temperature for consistent, factual analysis
         )
-        chunks = text_splitter.split_text(text)
-        return chunks
+        
+        # Parse the response
+        content = response.choices[0].message.content
+        
+        # Try to parse as JSON, fallback to text if not valid JSON
+        try:
+            analysis = json.loads(content)
+        except json.JSONDecodeError:
+            analysis = {
+                "raw_response": content,
+                "parsed": False
+            }
+        
+        analysis['page_number'] = page_number
+        analysis['model_used'] = "gpt-4-vision-preview"
+        
+        logger.info(f"Successfully analyzed page {page_number} with Vision API")
+        return analysis
+        
     except Exception as e:
-        logger.error(f"Error splitting text into chunks: {e}")
-        # Simple fallback chunking
-        words = text.split()
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        
-        for word in words:
-            if current_length + len(word) > 1000 and current_chunk:
-                chunks.append(' '.join(current_chunk))
-                current_chunk = [word]
-                current_length = len(word)
-            else:
-                current_chunk.append(word)
-                current_length += len(word) + 1
-        
-        if current_chunk:
-            chunks.append(' '.join(current_chunk))
-        
-        return chunks
+        logger.error(f"Error analyzing image with Vision API: {str(e)}")
+        raise
 
-def process_document(doc_info, drive_service, model):
-    """Process a document from Google Drive with enhanced text extraction."""
+def consolidate_page_analyses(page_analyses: List[Dict[str, Any]], document_type: str) -> Dict[str, Any]:
+    """Consolidate analyses from multiple pages into a single document summary."""
+    
+    consolidated = {
+        "document_type": document_type,
+        "total_pages": len(page_analyses),
+        "key_figures_consolidated": {},
+        "full_summary": "",
+        "page_summaries": [],
+        "notable_items_all": []
+    }
+    
+    # Collect data from all pages
+    for page_analysis in page_analyses:
+        if isinstance(page_analysis, dict):
+            if "key_figures" in page_analysis:
+                consolidated["key_figures_consolidated"].update(page_analysis["key_figures"])
+            
+            if "summary" in page_analysis:
+                consolidated["page_summaries"].append({
+                    "page": page_analysis.get("page_number", 0),
+                    "summary": page_analysis["summary"]
+                })
+            
+            if "notable_items" in page_analysis:
+                consolidated["notable_items_all"].extend(page_analysis["notable_items"])
+    
+    # Create consolidated summary
+    if consolidated["page_summaries"]:
+        consolidated["full_summary"] = " ".join([ps["summary"] for ps in consolidated["page_summaries"]])
+    
+    return consolidated
+
+def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
+    """Process a document using Vision API approach."""
     try:
-        # Check if model is available
-        if model is None:
-            logger.error("Model not available, cannot process embeddings")
-            update_document_status(doc_info["id"], "error", "Embedding model not available")
-            return False
+        logger.info(f"Processing document with Vision API: {doc_info['file_name']}")
         
         # Download file from Google Drive
         file_content = download_file_from_drive(drive_service, doc_info["drive_file_id"])
         
-        # Extract text using enhanced method
-        full_document_text, page_texts = extract_text_with_pymupdf(file_content)
-        logger.info(f"Extracted {len(full_document_text)} characters of text from {doc_info['file_name']}")
-        
-        if len(full_document_text) == 0:
-            logger.error(f"No text extracted from {doc_info['file_name']}")
-            update_document_status(doc_info["id"], "error", "No text could be extracted from the PDF")
-            return False
+        # Convert PDF to images
+        images = pdf_to_images(file_content)
+        if not images:
+            raise Exception("No images generated from PDF")
         
         # Identify document type
-        document_type = identify_document_type(full_document_text, doc_info["file_name"])
+        document_type = identify_document_type_from_filename(doc_info["file_name"])
         logger.info(f"Identified document type: {document_type}")
         
-        # Extract financial summary
-        financial_summary = extract_financial_summary(full_document_text, document_type)
-        logger.info(f"Generated financial summary with {len(financial_summary)} characters")
+        # Analyze each page with Vision API
+        page_analyses = []
+        for i, image_data in enumerate(images, 1):
+            try:
+                analysis = analyze_image_with_vision(image_data, document_type, i)
+                page_analyses.append(analysis)
+                
+                # Add delay to respect rate limits
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Failed to analyze page {i}: {str(e)}")
+                page_analyses.append({"error": str(e), "page_number": i})
         
-        # Split text into chunks
-        chunks = split_text_into_chunks(full_document_text)
-        logger.info(f"Split text into {len(chunks)} chunks")
+        # Consolidate analyses
+        consolidated_analysis = consolidate_page_analyses(page_analyses, document_type)
         
-        if len(chunks) == 0:
-            logger.error(f"No chunks generated from {doc_info['file_name']}")
-            update_document_status(doc_info["id"], "error", "No chunks could be generated from the PDF text")
-            return False
-        
-        # Create document record in database
+        # Store in database
         conn = get_postgres_connection()
         try:
             with conn.cursor() as cursor:
-                # Insert document with full text and financial summary
+                # Insert document with vision analysis
                 cursor.execute(
                     """
                     INSERT INTO ai_data.documents
                     (client_id, document_name, year, month, day, class, subclass, 
-                     drive_file_id, total_chunks, is_new, full_document_text, financial_summary)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     drive_file_id, total_chunks, is_new, full_document_text, financial_summary, vision_analysis)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -497,16 +429,17 @@ def process_document(doc_info, drive_service, model):
                         doc_info.get("class"),
                         doc_info.get("subclass"),
                         doc_info["drive_file_id"],
-                        len(chunks),
-                        True,  # Assuming all new documents are marked as new
-                        full_document_text,  # Store full document text
-                        financial_summary    # Store financial summary
+                        len(images),  # Use number of pages as chunks
+                        True,
+                        consolidated_analysis.get("full_summary", ""),  # Store summary as full text
+                        json.dumps(consolidated_analysis.get("key_figures_consolidated", {})),  # Key figures as financial summary
+                        json.dumps(consolidated_analysis)  # Complete analysis
                     )
                 )
                 document_id = cursor.fetchone()[0]
                 logger.info(f"Created document record with ID: {document_id}")
                 
-                # Update the document_tracking table with document_id
+                # Update tracking table
                 cursor.execute(
                     """
                     UPDATE ai_data.document_tracking
@@ -516,12 +449,8 @@ def process_document(doc_info, drive_service, model):
                     (document_id, doc_info["id"])
                 )
                 
-                # Process and store embeddings
-                for i, chunk_text in enumerate(chunks):
-                    # Generate embedding
-                    embedding = model.encode(chunk_text)
-                    
-                    # Store in PostgreSQL
+                # Store individual page analyses
+                for page_analysis in page_analyses:
                     cursor.execute(
                         """
                         INSERT INTO ai_data.document_embeddings
@@ -532,8 +461,8 @@ def process_document(doc_info, drive_service, model):
                         (
                             doc_info["client_id"],
                             doc_info["file_name"],
-                            i,
-                            chunk_text,
+                            page_analysis.get("page_number", 0),
+                            json.dumps(page_analysis),  # Store page analysis as text
                             doc_info.get("year"),
                             doc_info.get("month"),
                             doc_info.get("day"),
@@ -541,50 +470,35 @@ def process_document(doc_info, drive_service, model):
                             doc_info.get("subclass"),
                             document_id,
                             doc_info["drive_file_id"],
-                            embedding.tolist()  # Convert numpy array to list for PostgreSQL
+                            [0.0] * 384  # Placeholder embedding for now
                         )
                     )
                 
                 conn.commit()
-                logger.info(f"Successfully processed document {doc_info['file_name']} with {len(chunks)} chunks, full text ({len(full_document_text)} chars), and financial summary")
+                logger.info(f"Successfully processed document {doc_info['file_name']} with Vision API")
                 
-                # Update document status to 'processed'
+                # Update status to processed
                 update_document_status(doc_info["id"], "processed")
                 return True
                 
         except Exception as e:
             conn.rollback()
-            logger.error(f"Error processing document: {str(e)}")
+            logger.error(f"Error storing vision analysis: {str(e)}")
             update_document_status(doc_info["id"], "error", str(e))
             return False
         finally:
             conn.close()
             
     except Exception as e:
-        logger.error(f"Error processing document: {str(e)}")
+        logger.error(f"Error processing document with vision: {str(e)}")
         update_document_status(doc_info["id"], "error", str(e))
         return False
 
 def process_pending_documents():
-    """Process all pending documents."""
+    """Process all pending documents using Vision API."""
     try:
         # Initialize Drive API
         drive_service = get_drive_service()
-        
-        # Initialize embedding model with timeout handling
-        logger.info("Initializing SentenceTransformer model: all-MiniLM-L6-v2")
-        model = None
-        try:
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Model initialized successfully")
-        except Exception as model_error:
-            logger.error(f"Failed to initialize model: {model_error}")
-            return {
-                "documents_found": 0,
-                "documents_processed": 0,
-                "errors": 1,
-                "error": "Model initialization failed"
-            }
         
         # Get pending documents
         pending_docs = get_pending_documents()
@@ -596,7 +510,7 @@ def process_pending_documents():
         # Process each document
         for doc in pending_docs:
             logger.info(f"Processing document: {doc['file_name']} (ID: {doc['id']})")
-            success = process_document(doc, drive_service, model)
+            success = process_document_with_vision(doc, drive_service)
             if success:
                 documents_processed += 1
             else:
@@ -622,11 +536,16 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
         self.end_headers()
-        response = {'status': 'healthy', 'capabilities': {
-            'pymupdf': PYMUPDF_AVAILABLE,
-            'ocr': OCR_AVAILABLE,
-            'pypdf': PYPDF_AVAILABLE
-        }}
+        response = {
+            'status': 'healthy',
+            'approach': 'vision-api',
+            'capabilities': {
+                'pymupdf': PYMUPDF_AVAILABLE,
+                'pil': PIL_AVAILABLE,
+                'openai': OPENAI_AVAILABLE,
+                'api_key_configured': bool(OPENAI_API_KEY)
+            }
+        }
         self.wfile.write(json.dumps(response).encode('utf-8'))
     
     def do_POST(self):
@@ -659,7 +578,7 @@ def run_server():
     
     try:
         server = socketserver.TCPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-        logger.info(f'Starting server on port {port}')
+        logger.info(f'Starting Vision-based document processor on port {port}')
         server.serve_forever()
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
@@ -667,10 +586,11 @@ def run_server():
 
 if __name__ == "__main__":
     # Test basic functionality before starting server
-    logger.info("=== Starting document processor service ===")
+    logger.info("=== Starting Vision-based Document Processor ===")
     logger.info(f"PyMuPDF available: {PYMUPDF_AVAILABLE}")
-    logger.info(f"OCR available: {OCR_AVAILABLE}")
-    logger.info(f"PyPDF available: {PYPDF_AVAILABLE}")
+    logger.info(f"PIL available: {PIL_AVAILABLE}")
+    logger.info(f"OpenAI available: {OPENAI_AVAILABLE}")
+    logger.info(f"OpenAI API key configured: {bool(OPENAI_API_KEY)}")
     
     # Test database connection
     try:
@@ -680,7 +600,6 @@ if __name__ == "__main__":
         logger.info("Database connection test successful")
     except Exception as e:
         logger.error(f"Database connection test failed: {e}")
-        # Don't exit - service should still start for health checks
     
     # Start server
     logger.info("Starting HTTP server...")
