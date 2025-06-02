@@ -573,11 +573,11 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                         cursor.execute(
                             """
                             INSERT INTO ai_data.documents 
-                            (drive_file_id, full_document_text, financial_summary, vision_analysis, total_chunks, processed_at)
-                            VALUES (%s, %s, %s, %s, %s, NOW())
+                            (drive_file_id, document_name, full_document_text, financial_summary, vision_analysis, total_chunks, processed_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
                             RETURNING id
                             """,
-                            (doc_info["drive_file_id"], test_summary, test_financial, json.dumps(test_analysis), len(images))
+                            (doc_info["drive_file_id"], doc_info["file_name"], test_summary, test_financial, json.dumps(test_analysis), len(images))
                         )
                         
                         document_id = cursor.fetchone()[0]
@@ -645,12 +645,12 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                     # Try to update existing document or insert new one
                     cursor.execute(
                         """
-                        INSERT INTO ai_data.documents (drive_file_id, full_document_text, processed_at)
-                        VALUES (%s, %s, NOW())
+                        INSERT INTO ai_data.documents (drive_file_id, document_name, full_document_text, processed_at)
+                        VALUES (%s, %s, %s, NOW())
                         ON CONFLICT (drive_file_id) 
-                        DO UPDATE SET full_document_text = EXCLUDED.full_document_text, processed_at = NOW()
+                        DO UPDATE SET document_name = EXCLUDED.document_name, full_document_text = EXCLUDED.full_document_text, processed_at = NOW()
                         """,
-                        (doc_info["drive_file_id"], error_summary)
+                        (doc_info["drive_file_id"], doc_info["file_name"], error_summary)
                     )
                     conn.commit()
                     logger.info("✓ Error info stored in database")
