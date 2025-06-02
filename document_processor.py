@@ -192,6 +192,9 @@ def pdf_to_images(file_content: io.BytesIO) -> List[bytes]:
     if not PYMUPDF_AVAILABLE:
         raise Exception("PyMuPDF not available for PDF to image conversion")
     
+    if not PIL_AVAILABLE:
+        raise Exception("PIL not available for image processing")
+    
     try:
         file_content.seek(0)
         pdf_data = file_content.read()
@@ -201,16 +204,37 @@ def pdf_to_images(file_content: io.BytesIO) -> List[bytes]:
         for page_num in range(len(pdf_document)):
             page = pdf_document.load_page(page_num)
             
-            # Convert to high-quality image
+            # Convert to high-quality image with proper format
             # Use higher DPI for better OCR results
             pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # 2x scaling for better quality
-            img_data = pix.tobytes("png")
-            images.append(img_data)
             
-            logger.info(f"Converted page {page_num + 1} to image ({len(img_data)} bytes)")
+            # Convert PyMuPDF pixmap to PIL Image to ensure proper format
+            img_data = pix.tobytes("png")
+            pil_image = Image.open(io.BytesIO(img_data))
+            
+            # Convert to RGB if necessary (remove alpha channel issues)
+            if pil_image.mode in ('RGBA', 'LA'):
+                # Create white background
+                background = Image.new('RGB', pil_image.size, (255, 255, 255))
+                if pil_image.mode == 'RGBA':
+                    background.paste(pil_image, mask=pil_image.split()[-1])  # Use alpha channel as mask
+                else:
+                    background.paste(pil_image, mask=pil_image.split()[-1])
+                pil_image = background
+            elif pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+            
+            # Save as high-quality JPEG (more compatible than PNG)
+            img_buffer = io.BytesIO()
+            pil_image.save(img_buffer, format='JPEG', quality=95, optimize=True)
+            final_img_data = img_buffer.getvalue()
+            
+            images.append(final_img_data)
+            
+            logger.info(f"Converted page {page_num + 1} to JPEG image ({len(final_img_data)} bytes)")
         
         pdf_document.close()
-        logger.info(f"Successfully converted PDF to {len(images)} images")
+        logger.info(f"Successfully converted PDF to {len(images)} JPEG images")
         return images
         
     except Exception as e:
@@ -297,7 +321,10 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
         if page_number > 1:
             prompt += f"\n\nThis is page {page_number} of the document. Focus on the content visible on this specific page."
         
-        response = openai.chat.completions.create(
+        # Use the newer client interface
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        
+        response = client.chat.completions.create(
             model="gpt-4-vision-preview",
             messages=[
                 {
@@ -307,7 +334,7 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{image_base64}",
+                                "url": f"data:image/jpeg;base64,{image_base64}",  # Changed to JPEG
                                 "detail": "high"  # Use high detail for better analysis
                             }
                         }
