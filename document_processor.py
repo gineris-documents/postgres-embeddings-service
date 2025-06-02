@@ -74,8 +74,12 @@ SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service-account.j
 
 # Initialize OpenAI client
 if OPENAI_AVAILABLE and OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-    logger.info("OpenAI API key configured")
+    try:
+        import openai
+        openai.api_key = OPENAI_API_KEY
+        logger.info("OpenAI API key configured")
+    except Exception as e:
+        logger.error(f"Failed to configure OpenAI: {e}")
 else:
     logger.error("OpenAI API key not configured or library not available")
 
@@ -326,11 +330,16 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
         
         logger.info(f"Using prompt: {prompt[:100]}...")
         
-        # Use the newer client interface with timeout
-        client = openai.OpenAI(
-            api_key=OPENAI_API_KEY,
-            timeout=60.0  # 60 second timeout
-        )
+        # Use compatible client initialization
+        try:
+            # Try new client interface first
+            client = openai.OpenAI(api_key=OPENAI_API_KEY)
+            use_new_interface = True
+            logger.info("Using new OpenAI client interface")
+        except Exception as client_error:
+            # Fallback to old interface
+            logger.info("New client failed, using legacy interface")
+            use_new_interface = False
         
         logger.info("Calling OpenAI Vision API...")
         
@@ -341,26 +350,49 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
             try:
                 logger.info(f"Trying model: {model_name}")
                 
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_base64}",
-                                        "detail": "high"
+                if use_new_interface:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{image_base64}",
+                                            "detail": "high"
+                                        }
                                     }
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=1000,
-                    temperature=0.1
-                )
+                                ]
+                            }
+                        ],
+                        max_tokens=1000,
+                        temperature=0.1
+                    )
+                else:
+                    # Legacy interface
+                    response = openai.ChatCompletion.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{image_base64}",
+                                            "detail": "high"
+                                        }
+                                    }
+                                ]
+                            }
+                        ],
+                        max_tokens=1000,
+                        temperature=0.1
+                    )
                 
                 logger.info(f"✓ Vision API call successful with {model_name}")
                 break  # Success, exit the loop
@@ -371,8 +403,12 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                     raise model_error
                 continue  # Try next model
         
-        # Parse the response
-        content = response.choices[0].message.content
+        # Parse the response (compatible with both interfaces)
+        if use_new_interface:
+            content = response.choices[0].message.content
+        else:
+            content = response['choices'][0]['message']['content']
+            
         logger.info(f"Received response: {len(content)} characters")
         
         # Try to parse as JSON, fallback to text if not valid JSON
@@ -665,22 +701,37 @@ if __name__ == "__main__":
     if OPENAI_AVAILABLE and OPENAI_API_KEY:
         try:
             logger.info("Testing OpenAI API connection...")
-            client = openai.OpenAI(api_key=OPENAI_API_KEY, timeout=30.0)
             
-            # Simple API test
-            response = client.chat.completions.create(
+            # Try simple API test with legacy interface first
+            response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": "Hello, this is a test. Respond with 'API working'."}],
                 max_tokens=10
             )
             
-            if response.choices[0].message.content:
-                logger.info("✓ OpenAI API key is working")
+            if response['choices'][0]['message']['content']:
+                logger.info("✓ OpenAI API key is working (legacy interface)")
             else:
                 logger.error("✗ OpenAI API returned empty response")
                 
-        except Exception as api_error:
-            logger.error(f"✗ OpenAI API test failed: {str(api_error)}")
+        except Exception as legacy_error:
+            logger.info(f"Legacy interface failed: {str(legacy_error)}")
+            try:
+                # Try new interface
+                client = openai.OpenAI(api_key=OPENAI_API_KEY)
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": "Hello, this is a test. Respond with 'API working'."}],
+                    max_tokens=10
+                )
+                
+                if response.choices[0].message.content:
+                    logger.info("✓ OpenAI API key is working (new interface)")
+                else:
+                    logger.error("✗ OpenAI API returned empty response")
+                    
+            except Exception as new_error:
+                logger.error(f"✗ Both OpenAI interfaces failed. Legacy: {str(legacy_error)}, New: {str(new_error)}")
     else:
         logger.error("✗ OpenAI API key not configured or library not available")
     
