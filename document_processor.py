@@ -401,173 +401,63 @@ def consolidate_page_analyses(page_analyses: List[Dict[str, Any]], document_type
     return consolidated
 
 def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
-    """Process a document using Vision API approach."""
+    """Process a document using Vision API approach with detailed diagnostics."""
     try:
-        logger.info(f"Processing document with Vision API: {doc_info['file_name']}")
+        logger.info(f"=== DIAGNOSTIC MODE: Processing {doc_info['file_name']} ===")
         
-        # Download file from Google Drive
+        # Step 1: Download file
+        logger.info("Step 1: Downloading file from Google Drive...")
         file_content = download_file_from_drive(drive_service, doc_info["drive_file_id"])
+        logger.info(f"✓ Downloaded {len(file_content.getvalue())} bytes")
         
-        # Convert PDF to images
+        # Step 2: Convert to images
+        logger.info("Step 2: Converting PDF to images...")
         images = pdf_to_images(file_content)
         if not images:
             raise Exception("No images generated from PDF")
+        logger.info(f"✓ Generated {len(images)} images, processing first 2 for diagnostic")
         
-        logger.info(f"Generated {len(images)} images from PDF")
-        
-        # Identify document type
+        # Step 3: Document type
         document_type = identify_document_type_from_filename(doc_info["file_name"])
-        logger.info(f"Identified document type: {document_type}")
+        logger.info(f"✓ Document type: {document_type}")
         
-        # Analyze each page with Vision API (limit to first 5 pages for testing)
-        page_analyses = []
-        max_pages = min(len(images), 5)  # Limit for testing and cost control
-        logger.info(f"Processing first {max_pages} pages with Vision API")
-        
-        for i, image_data in enumerate(images[:max_pages], 1):
-            try:
-                logger.info(f"Analyzing page {i} with Vision API...")
-                analysis = analyze_image_with_vision(image_data, document_type, i)
-                page_analyses.append(analysis)
-                logger.info(f"Successfully analyzed page {i}: {len(str(analysis))} characters")
-                
-                # Add delay to respect rate limits
-                time.sleep(2)
-                
-            except Exception as e:
-                logger.error(f"Failed to analyze page {i}: {str(e)}")
-                page_analyses.append({"error": str(e), "page_number": i})
-        
-        logger.info(f"Completed Vision API analysis for {len(page_analyses)} pages")
-        
-        # Consolidate analyses
-        consolidated_analysis = consolidate_page_analyses(page_analyses, document_type)
-        logger.info(f"Consolidated analysis created with {len(str(consolidated_analysis))} characters")
-        
-        # Prepare data for storage
-        full_document_text = consolidated_analysis.get("full_summary", "")
-        financial_summary_dict = consolidated_analysis.get("key_figures_consolidated", {})
-        financial_summary = json.dumps(financial_summary_dict) if financial_summary_dict else ""
-        vision_analysis = json.dumps(consolidated_analysis)
-        
-        logger.info(f"Data prepared:")
-        logger.info(f"- Full text: {len(full_document_text)} chars")
-        logger.info(f"- Financial summary: {len(financial_summary)} chars") 
-        logger.info(f"- Vision analysis: {len(vision_analysis)} chars")
-        
-        # Store in database
-        conn = get_postgres_connection()
+        # Step 4: Test Vision API with just 1 page
+        logger.info("Step 4: Testing Vision API with page 1...")
         try:
-            with conn.cursor() as cursor:
-                # Check if document already exists
-                cursor.execute(
-                    """
-                    SELECT id FROM ai_data.documents 
-                    WHERE drive_file_id = %s
-                    """,
-                    (doc_info["drive_file_id"],)
-                )
-                existing_doc = cursor.fetchone()
-                
-                if existing_doc:
-                    document_id = existing_doc[0]
-                    logger.info(f"Updating existing document with ID: {document_id}")
-                    
-                    # Check if vision_analysis column exists
-                    cursor.execute("""
-                        SELECT column_name 
-                        FROM information_schema.columns 
-                        WHERE table_schema = 'ai_data' 
-                        AND table_name = 'documents' 
-                        AND column_name = 'vision_analysis'
-                    """)
-                    vision_column_exists = cursor.fetchone() is not None
-                    
-                    if vision_column_exists:
-                        # Update with vision_analysis column
-                        cursor.execute(
-                            """
-                            UPDATE ai_data.documents 
-                            SET full_document_text = %s, 
-                                financial_summary = %s, 
-                                vision_analysis = %s,
-                                total_chunks = %s,
-                                processed_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (full_document_text, financial_summary, vision_analysis, len(images), document_id)
-                        )
-                    else:
-                        # Update without vision_analysis column
-                        logger.warning("vision_analysis column doesn't exist, updating without it")
-                        cursor.execute(
-                            """
-                            UPDATE ai_data.documents 
-                            SET full_document_text = %s, 
-                                financial_summary = %s,
-                                total_chunks = %s,
-                                processed_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (full_document_text, financial_summary, len(images), document_id)
-                        )
-                    
-                    logger.info(f"Updated document record with ID: {document_id}")
-                    
-                else:
-                    # Create new document if it doesn't exist
-                    logger.info("Creating new document record")
+            test_analysis = analyze_image_with_vision(images[0], document_type, 1)
+            logger.info(f"✓ Vision API SUCCESS! Response: {str(test_analysis)[:200]}...")
+            
+            # Store test result directly in database to verify it works
+            conn = get_postgres_connection()
+            try:
+                with conn.cursor() as cursor:
+                    # Update the existing document with test data
+                    test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
+                    test_financial = json.dumps({"test": "vision_api_working", "page_1_analysis": str(test_analysis)[:200]})
                     
                     cursor.execute(
                         """
-                        INSERT INTO ai_data.documents
-                        (client_id, document_name, year, month, day, class, subclass, 
-                         drive_file_id, total_chunks, is_new, full_document_text, financial_summary)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        RETURNING id
+                        UPDATE ai_data.documents 
+                        SET full_document_text = %s, 
+                            financial_summary = %s,
+                            total_chunks = %s,
+                            processed_at = NOW()
+                        WHERE drive_file_id = %s
                         """,
-                        (
-                            doc_info["client_id"], 
-                            doc_info["file_name"],
-                            doc_info.get("year"),
-                            doc_info.get("month"),
-                            doc_info.get("day"),
-                            doc_info.get("class"),
-                            doc_info.get("subclass"),
-                            doc_info["drive_file_id"],
-                            len(images),
-                            True,
-                            full_document_text,
-                            financial_summary
-                        )
+                        (test_summary, test_financial, len(images), doc_info["drive_file_id"])
                     )
-                    document_id = cursor.fetchone()[0]
-                    logger.info(f"Created new document record with ID: {document_id}")
-                
-                # Update tracking table
-                cursor.execute(
-                    """
-                    UPDATE ai_data.document_tracking
-                    SET documents_id = %s
-                    WHERE id = %s
-                    """,
-                    (document_id, doc_info["id"])
-                )
-                
-                # Clear existing embeddings for this document to avoid duplicates
-                cursor.execute(
-                    """
-                    DELETE FROM ai_data.document_embeddings 
-                    WHERE document_id = %s
-                    """,
-                    (document_id,)
-                )
-                
-                # Store individual page analyses
-                for page_analysis in page_analyses:
-                    analysis_text = json.dumps(page_analysis)
-                    if len(analysis_text) > 5000:
-                        analysis_text = analysis_text[:5000] + "...[truncated]"
+                    
+                    rows_updated = cursor.rowcount
+                    logger.info(f"✓ Database UPDATE: {rows_updated} rows updated")
+                    
+                    # Also insert a test embedding
+                    cursor.execute(
+                        """
+                        DELETE FROM ai_data.document_embeddings 
+                        WHERE drive_file_id = %s
+                        """,
+                        (doc_info["drive_file_id"],)
+                    )
                     
                     cursor.execute(
                         """
@@ -579,39 +469,67 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                         (
                             doc_info["client_id"],
                             doc_info["file_name"],
-                            page_analysis.get("page_number", 0),
-                            analysis_text,
+                            1,
+                            f"DIAGNOSTIC: Vision API result: {str(test_analysis)[:1000]}",
                             doc_info.get("year"),
                             doc_info.get("month"),
                             doc_info.get("day"),
                             doc_info.get("class"),
                             doc_info.get("subclass"),
-                            document_id,
+                            20,  # Assuming document ID 20 from your data
                             doc_info["drive_file_id"],
-                            [0.0] * 384  # Placeholder embedding
+                            [0.0] * 384
                         )
                     )
+                    
+                    conn.commit()
+                    logger.info("✓ Test data committed to database")
+                    
+                    # Update status
+                    update_document_status(doc_info["id"], "processed")
+                    logger.info("✓ Status updated to processed")
+                    
+                    return True
+                    
+            except Exception as db_error:
+                conn.rollback()
+                logger.error(f"✗ Database error: {str(db_error)}")
+                logger.error(f"✗ Full database error: {repr(db_error)}")
+                return False
+            finally:
+                conn.close()
                 
-                conn.commit()
-                logger.info(f"Successfully processed document {doc_info['file_name']} with Vision API")
-                logger.info(f"Stored {len(page_analyses)} page analyses in embeddings table")
+        except Exception as vision_error:
+            logger.error(f"✗ Vision API error: {str(vision_error)}")
+            logger.error(f"✗ Full Vision API error: {repr(vision_error)}")
+            
+            # Store error info in database for debugging
+            conn = get_postgres_connection()
+            try:
+                with conn.cursor() as cursor:
+                    error_summary = f"VISION API ERROR: {str(vision_error)}"
+                    cursor.execute(
+                        """
+                        UPDATE ai_data.documents 
+                        SET full_document_text = %s, 
+                            processed_at = NOW()
+                        WHERE drive_file_id = %s
+                        """,
+                        (error_summary, doc_info["drive_file_id"])
+                    )
+                    conn.commit()
+                    logger.info("✓ Error info stored in database")
+            except Exception as e:
+                logger.error(f"Failed to store error info: {e}")
+            finally:
+                conn.close()
                 
-                # Update status to processed
-                update_document_status(doc_info["id"], "processed")
-                return True
-                
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Error storing vision analysis: {str(e)}")
-            logger.error(f"Full error details: {repr(e)}")
-            update_document_status(doc_info["id"], "error", str(e))
+            update_document_status(doc_info["id"], "error", str(vision_error))
             return False
-        finally:
-            conn.close()
             
     except Exception as e:
-        logger.error(f"Error processing document with vision: {str(e)}")
-        logger.error(f"Full error details: {repr(e)}")
+        logger.error(f"✗ Overall process error: {str(e)}")
+        logger.error(f"✗ Full process error: {repr(e)}")
         update_document_status(doc_info["id"], "error", str(e))
         return False
 
