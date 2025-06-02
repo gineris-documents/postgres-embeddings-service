@@ -19,5 +19,5 @@ Pillow==10.0.0
 # Text processing
 langchain==0.1.0
 
-# OpenAI - use specific compatible version
-openai==1.3.7
+# OpenAI - use older version that supports both interfaces
+openai==0.28.1
