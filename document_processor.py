@@ -51,12 +51,12 @@ except ImportError as e:
     logger.warning(f"PIL not available: {e}")
 
 try:
-    import openai
-    OPENAI_AVAILABLE = True
-    logger.info("OpenAI library imported successfully")
+    import requests
+    REQUESTS_AVAILABLE = True
+    logger.info("Requests library imported successfully")
 except ImportError as e:
-    OPENAI_AVAILABLE = False
-    logger.error(f"OpenAI library not available: {e}")
+    REQUESTS_AVAILABLE = False
+    logger.error(f"Requests library not available: {e}")
 
 # Configuration
 PROJECT_ID = os.environ.get("PROJECT_ID", "pdf-to-pinecone")
@@ -64,24 +64,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # PostgreSQL Configuration
 PG_HOST = os.environ.get("PG_HOST", "34.66.180.234")
-PG_DATABASE = os.environ.get("PG_DATABASE", "gineris_dev")
+PG_DATABASE = os.environ.get("PG_DATABASE", "postgres")  # Fixed: match your actual database name
 PG_USER = os.environ.get("PG_USER", "admin")
 PG_PASSWORD = os.environ.get("PG_PASSWORD", "H@nnib@lMO2015")
 
 # Google Drive API configuration
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service-account.json")
-
-# Initialize OpenAI client
-if OPENAI_AVAILABLE and OPENAI_API_KEY:
-    try:
-        import openai
-        openai.api_key = OPENAI_API_KEY
-        logger.info("OpenAI API key configured")
-    except Exception as e:
-        logger.error(f"Failed to configure OpenAI: {e}")
-else:
-    logger.error("OpenAI API key not configured or library not available")
 
 def get_drive_service():
     """Create and return a Google Drive service."""
@@ -133,6 +122,64 @@ def get_postgres_connection():
     except Exception as e:
         logger.error(f"Failed to connect to PostgreSQL: {str(e)}")
         raise
+
+def check_database_schema():
+    """Check if the required database schema exists."""
+    conn = get_postgres_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Check if ai_data schema exists
+        cursor.execute("""
+            SELECT schema_name FROM information_schema.schemata 
+            WHERE schema_name = 'ai_data'
+        """)
+        schema_exists = cursor.fetchone() is not None
+        
+        if not schema_exists:
+            logger.warning("ai_data schema does not exist. Creating it...")
+            cursor.execute("CREATE SCHEMA IF NOT EXISTS ai_data")
+            conn.commit()
+            logger.info("✓ Created ai_data schema")
+        
+        # Check if documents table exists in ai_data schema
+        cursor.execute("""
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = 'ai_data' AND table_name = 'documents'
+        """)
+        table_exists = cursor.fetchone() is not None
+        
+        if not table_exists:
+            logger.error("❌ ai_data.documents table does not exist")
+            return False
+        
+        # Check if vision_analysis column exists
+        cursor.execute("""
+            SELECT column_name FROM information_schema.columns 
+            WHERE table_schema = 'ai_data' AND table_name = 'documents' 
+            AND column_name = 'vision_analysis'
+        """)
+        vision_column_exists = cursor.fetchone() is not None
+        
+        if not vision_column_exists:
+            logger.warning("vision_analysis column missing. Adding it...")
+            cursor.execute("""
+                ALTER TABLE ai_data.documents 
+                ADD COLUMN IF NOT EXISTS vision_analysis TEXT
+            """)
+            conn.commit()
+            logger.info("✓ Added vision_analysis column")
+        
+        logger.info("✓ Database schema check complete")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Database schema check failed: {str(e)}")
+        conn.rollback()
+        return False
+    finally:
+        cursor.close()
+        conn.close()
 
 def get_pending_documents():
     """Get pending documents from the tracking table."""
@@ -311,8 +358,8 @@ Focus on:
 
 def analyze_image_with_vision(image_data: bytes, document_type: str, page_number: int) -> Dict[str, Any]:
     """Analyze a single image using OpenAI Vision API."""
-    if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
-        raise Exception("OpenAI not available or API key not configured")
+    if not REQUESTS_AVAILABLE or not OPENAI_API_KEY:
+        raise Exception("Requests library not available or OpenAI API key not configured")
     
     try:
         logger.info(f"Starting Vision API analysis for page {page_number}...")
@@ -331,15 +378,13 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
         logger.info(f"Using prompt: {prompt[:100]}...")
         logger.info("Calling OpenAI Vision API...")
         
-        # Simple direct API call without client initialization issues
-        import requests
-        
+        # Use requests library for API calls
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
         
-        # Try gpt-4o first (newer model), fallback to gpt-4-vision-preview
+        # Try multiple models with fallback
         models_to_try = ["gpt-4o", "gpt-4-vision-preview"]
         
         for model_name in models_to_try:
@@ -373,6 +418,8 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                     json=payload,
                     timeout=60
                 )
+                
+                logger.info(f"API Response Status: {response.status_code}")
                 
                 if response.status_code == 200:
                     result = response.json()
@@ -475,30 +522,71 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
             test_analysis = analyze_image_with_vision(images[0], document_type, 1)
             logger.info(f"✓ Vision API SUCCESS! Response: {str(test_analysis)[:200]}...")
             
-            # Store test result directly in database to verify it works
+            # Step 5: Store test result directly in database
+            logger.info("Step 5: Storing results in database...")
             conn = get_postgres_connection()
             try:
                 with conn.cursor() as cursor:
-                    # Update the existing document with test data
-                    test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
-                    test_financial = json.dumps({"test": "vision_api_working", "page_1_analysis": str(test_analysis)[:200]})
-                    
+                    # Check if document exists in ai_data.documents
                     cursor.execute(
                         """
-                        UPDATE ai_data.documents 
-                        SET full_document_text = %s, 
-                            financial_summary = %s,
-                            total_chunks = %s,
-                            processed_at = NOW()
+                        SELECT id FROM ai_data.documents 
                         WHERE drive_file_id = %s
                         """,
-                        (test_summary, test_financial, len(images), doc_info["drive_file_id"])
+                        (doc_info["drive_file_id"],)
                     )
                     
-                    rows_updated = cursor.rowcount
-                    logger.info(f"✓ Database UPDATE: {rows_updated} rows updated")
+                    doc_row = cursor.fetchone()
                     
-                    # Also insert a test embedding
+                    if doc_row:
+                        # Update existing document
+                        test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
+                        test_financial = json.dumps({
+                            "test": "vision_api_working", 
+                            "page_1_analysis": str(test_analysis)[:200],
+                            "model_used": test_analysis.get("model_used", "unknown"),
+                            "timestamp": time.time()
+                        })
+                        
+                        cursor.execute(
+                            """
+                            UPDATE ai_data.documents 
+                            SET full_document_text = %s, 
+                                financial_summary = %s,
+                                vision_analysis = %s,
+                                total_chunks = %s,
+                                processed_at = NOW()
+                            WHERE drive_file_id = %s
+                            """,
+                            (test_summary, test_financial, json.dumps(test_analysis), len(images), doc_info["drive_file_id"])
+                        )
+                        
+                        rows_updated = cursor.rowcount
+                        logger.info(f"✓ Database UPDATE: {rows_updated} rows updated")
+                    else:
+                        # Insert new document
+                        logger.info("Document not found in ai_data.documents, inserting new record...")
+                        
+                        test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
+                        test_financial = json.dumps({
+                            "test": "vision_api_working", 
+                            "page_1_analysis": str(test_analysis)[:200],
+                            "model_used": test_analysis.get("model_used", "unknown"),
+                            "timestamp": time.time()
+                        })
+                        
+                        cursor.execute(
+                            """
+                            INSERT INTO ai_data.documents 
+                            (drive_file_id, full_document_text, financial_summary, vision_analysis, total_chunks, processed_at)
+                            VALUES (%s, %s, %s, %s, %s, NOW())
+                            """,
+                            (doc_info["drive_file_id"], test_summary, test_financial, json.dumps(test_analysis), len(images))
+                        )
+                        
+                        logger.info("✓ New document inserted into ai_data.documents")
+                    
+                    # Clean up old embeddings and insert test embedding
                     cursor.execute(
                         """
                         DELETE FROM ai_data.document_embeddings 
@@ -515,18 +603,18 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
-                            doc_info["client_id"],
+                            doc_info.get("client_id", 1),
                             doc_info["file_name"],
                             1,
                             f"DIAGNOSTIC: Vision API result: {str(test_analysis)[:1000]}",
-                            doc_info.get("year"),
-                            doc_info.get("month"),
-                            doc_info.get("day"),
-                            doc_info.get("class"),
-                            doc_info.get("subclass"),
-                            20,  # Assuming document ID 20 from your data
+                            doc_info.get("year", 2024),
+                            doc_info.get("month", 12),
+                            doc_info.get("day", 1),
+                            doc_info.get("class", "financial"),
+                            doc_info.get("subclass", "statement"),
+                            doc_info.get("document_id", 20),
                             doc_info["drive_file_id"],
-                            [0.0] * 384
+                            [0.0] * 384  # Dummy embedding vector
                         )
                     )
                     
@@ -556,14 +644,16 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
             try:
                 with conn.cursor() as cursor:
                     error_summary = f"VISION API ERROR: {str(vision_error)}"
+                    
+                    # Try to update existing document or insert new one
                     cursor.execute(
                         """
-                        UPDATE ai_data.documents 
-                        SET full_document_text = %s, 
-                            processed_at = NOW()
-                        WHERE drive_file_id = %s
+                        INSERT INTO ai_data.documents (drive_file_id, full_document_text, processed_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (drive_file_id) 
+                        DO UPDATE SET full_document_text = EXCLUDED.full_document_text, processed_at = NOW()
                         """,
-                        (error_summary, doc_info["drive_file_id"])
+                        (doc_info["drive_file_id"], error_summary)
                     )
                     conn.commit()
                     logger.info("✓ Error info stored in database")
@@ -584,6 +674,16 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
 def process_pending_documents():
     """Process all pending documents using Vision API."""
     try:
+        # Check database schema first
+        if not check_database_schema():
+            logger.error("Database schema check failed, aborting")
+            return {
+                "documents_found": 0,
+                "documents_processed": 0,
+                "errors": 1,
+                "error": "Database schema check failed"
+            }
+        
         # Initialize Drive API
         drive_service = get_drive_service()
         
@@ -629,7 +729,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             'capabilities': {
                 'pymupdf': PYMUPDF_AVAILABLE,
                 'pil': PIL_AVAILABLE,
-                'openai': OPENAI_AVAILABLE,
+                'requests': REQUESTS_AVAILABLE,
                 'api_key_configured': bool(OPENAI_API_KEY)
             }
         }
@@ -676,16 +776,13 @@ if __name__ == "__main__":
     logger.info("=== Starting Vision-based Document Processor ===")
     logger.info(f"PyMuPDF available: {PYMUPDF_AVAILABLE}")
     logger.info(f"PIL available: {PIL_AVAILABLE}")
-    logger.info(f"OpenAI available: {OPENAI_AVAILABLE}")
+    logger.info(f"Requests available: {REQUESTS_AVAILABLE}")
     logger.info(f"OpenAI API key configured: {bool(OPENAI_API_KEY)}")
     
     # Test OpenAI API key
-    if OPENAI_AVAILABLE and OPENAI_API_KEY:
+    if REQUESTS_AVAILABLE and OPENAI_API_KEY:
         try:
             logger.info("Testing OpenAI API connection...")
-            
-            # Use direct HTTP request to avoid library version issues
-            import requests
             
             headers = {
                 "Content-Type": "application/json",
@@ -717,7 +814,7 @@ if __name__ == "__main__":
         except Exception as api_error:
             logger.error(f"✗ OpenAI API test failed: {str(api_error)}")
     else:
-        logger.error("✗ OpenAI API key not configured or library not available")
+        logger.error("✗ OpenAI API key not configured or requests library not available")
     
     # Test database connection
     try:
