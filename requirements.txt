@@ -19,8 +19,5 @@ Pillow==10.0.0
 # Text processing
 langchain==0.1.0
 
-# HTTP requests for OpenAI API
+# HTTP requests for OpenAI API (no openai library needed)
 requests==2.31.0
-
-# OpenAI - use older version that supports both interfaces
-openai==0.28.1
