@@ -311,8 +311,11 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
         raise Exception("OpenAI not available or API key not configured")
     
     try:
+        logger.info(f"Starting Vision API analysis for page {page_number}...")
+        
         # Encode image to base64
         image_base64 = base64.b64encode(image_data).decode('utf-8')
+        logger.info(f"Encoded image to base64: {len(image_base64)} characters")
         
         # Get appropriate prompt
         prompt = get_document_analysis_prompt(document_type)
@@ -321,50 +324,77 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
         if page_number > 1:
             prompt += f"\n\nThis is page {page_number} of the document. Focus on the content visible on this specific page."
         
-        # Use the newer client interface
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        logger.info(f"Using prompt: {prompt[:100]}...")
         
-        response = client.chat.completions.create(
-            model="gpt-4-vision-preview",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}",  # Changed to JPEG
-                                "detail": "high"  # Use high detail for better analysis
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=1000,
-            temperature=0.1  # Low temperature for consistent, factual analysis
+        # Use the newer client interface with timeout
+        client = openai.OpenAI(
+            api_key=OPENAI_API_KEY,
+            timeout=60.0  # 60 second timeout
         )
+        
+        logger.info("Calling OpenAI Vision API...")
+        
+        # Try gpt-4o first (newer model), fallback to gpt-4-vision-preview
+        models_to_try = ["gpt-4o", "gpt-4-vision-preview"]
+        
+        for model_name in models_to_try:
+            try:
+                logger.info(f"Trying model: {model_name}")
+                
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_base64}",
+                                        "detail": "high"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=1000,
+                    temperature=0.1
+                )
+                
+                logger.info(f"✓ Vision API call successful with {model_name}")
+                break  # Success, exit the loop
+                
+            except Exception as model_error:
+                logger.error(f"✗ Model {model_name} failed: {str(model_error)}")
+                if model_name == models_to_try[-1]:  # Last model, re-raise error
+                    raise model_error
+                continue  # Try next model
         
         # Parse the response
         content = response.choices[0].message.content
+        logger.info(f"Received response: {len(content)} characters")
         
         # Try to parse as JSON, fallback to text if not valid JSON
         try:
             analysis = json.loads(content)
+            logger.info("✓ Response parsed as valid JSON")
         except json.JSONDecodeError:
+            logger.info("Response is not JSON, storing as raw text")
             analysis = {
                 "raw_response": content,
                 "parsed": False
             }
         
         analysis['page_number'] = page_number
-        analysis['model_used'] = "gpt-4-vision-preview"
+        analysis['model_used'] = model_name
         
-        logger.info(f"Successfully analyzed page {page_number} with Vision API")
+        logger.info(f"✓ Successfully analyzed page {page_number} with Vision API")
         return analysis
         
     except Exception as e:
-        logger.error(f"Error analyzing image with Vision API: {str(e)}")
+        logger.error(f"✗ Error analyzing image with Vision API: {str(e)}")
+        logger.error(f"✗ Full error details: {repr(e)}")
         raise
 
 def consolidate_page_analyses(page_analyses: List[Dict[str, Any]], document_type: str) -> Dict[str, Any]:
@@ -631,14 +661,37 @@ if __name__ == "__main__":
     logger.info(f"OpenAI available: {OPENAI_AVAILABLE}")
     logger.info(f"OpenAI API key configured: {bool(OPENAI_API_KEY)}")
     
+    # Test OpenAI API key
+    if OPENAI_AVAILABLE and OPENAI_API_KEY:
+        try:
+            logger.info("Testing OpenAI API connection...")
+            client = openai.OpenAI(api_key=OPENAI_API_KEY, timeout=30.0)
+            
+            # Simple API test
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": "Hello, this is a test. Respond with 'API working'."}],
+                max_tokens=10
+            )
+            
+            if response.choices[0].message.content:
+                logger.info("✓ OpenAI API key is working")
+            else:
+                logger.error("✗ OpenAI API returned empty response")
+                
+        except Exception as api_error:
+            logger.error(f"✗ OpenAI API test failed: {str(api_error)}")
+    else:
+        logger.error("✗ OpenAI API key not configured or library not available")
+    
     # Test database connection
     try:
         logger.info("Testing database connection...")
         conn = get_postgres_connection()
         conn.close()
-        logger.info("Database connection test successful")
+        logger.info("✓ Database connection test successful")
     except Exception as e:
-        logger.error(f"Database connection test failed: {e}")
+        logger.error(f"✗ Database connection test failed: {e}")
     
     # Start server
     logger.info("Starting HTTP server...")
