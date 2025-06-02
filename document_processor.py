@@ -35,7 +35,7 @@ except ImportError as e:
     logger.error(f"Failed to import Google API libraries: {e}")
 
 try:
-    import fitz  # PyMuPDF for PDF to image conversion
+    import fitz  # PyMuPDF for PDF text extraction
     PYMUPDF_AVAILABLE = True
     logger.info("PyMuPDF imported successfully")
 except ImportError as e:
@@ -51,6 +51,14 @@ except ImportError as e:
     logger.warning(f"PIL not available: {e}")
 
 try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+    logger.info("Tesseract imported successfully")
+except ImportError as e:
+    TESSERACT_AVAILABLE = False
+    logger.warning(f"Tesseract not available: {e}")
+
+try:
     import requests
     REQUESTS_AVAILABLE = True
     logger.info("Requests library imported successfully")
@@ -64,7 +72,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # PostgreSQL Configuration
 PG_HOST = os.environ.get("PG_HOST", "34.66.180.234")
-PG_DATABASE = os.environ.get("PG_DATABASE", "postgres")  # Fixed: match your actual database name
+PG_DATABASE = os.environ.get("PG_DATABASE", "postgres")
 PG_USER = os.environ.get("PG_USER", "admin")
 PG_PASSWORD = os.environ.get("PG_PASSWORD", "H@nnib@lMO2015")
 
@@ -238,59 +246,53 @@ def update_document_status(doc_id, status, error_message=None):
         cursor.close()
         conn.close()
 
-def pdf_to_images(file_content: io.BytesIO) -> List[bytes]:
-    """Convert PDF to high-quality images using PyMuPDF."""
+def extract_pdf_text_content(file_content: io.BytesIO) -> str:
+    """Extract text content from PDF using PyMuPDF (same as working Google Drive tool)"""
     if not PYMUPDF_AVAILABLE:
-        raise Exception("PyMuPDF not available for PDF to image conversion")
-    
-    if not PIL_AVAILABLE:
-        raise Exception("PIL not available for image processing")
+        raise Exception("PyMuPDF not available for PDF text extraction")
     
     try:
         file_content.seek(0)
         pdf_data = file_content.read()
-        pdf_document = fitz.open("pdf", pdf_data)
+        doc = fitz.open(stream=pdf_data, filetype="pdf")
         
-        images = []
-        for page_num in range(len(pdf_document)):
-            page = pdf_document.load_page(page_num)
+        all_text = ""
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            page_text = page.get_text()
             
-            # Convert to high-quality image with proper format
-            # Use higher DPI for better OCR results
-            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))  # 2x scaling for better quality
+            # If direct extraction fails, try OCR
+            if len(page_text.strip()) < 50 and PIL_AVAILABLE and TESSERACT_AVAILABLE:
+                try:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                    img_data = pix.tobytes("png")
+                    image = Image.open(io.BytesIO(img_data))
+                    page_text = pytesseract.image_to_string(image, lang="eng")
+                    logger.info(f"Used OCR for page {page_num + 1}")
+                except Exception as ocr_error:
+                    logger.warning(f"OCR failed for page {page_num + 1}: {str(ocr_error)}")
             
-            # Convert PyMuPDF pixmap to PIL Image to ensure proper format
-            img_data = pix.tobytes("png")
-            pil_image = Image.open(io.BytesIO(img_data))
-            
-            # Convert to RGB if necessary (remove alpha channel issues)
-            if pil_image.mode in ('RGBA', 'LA'):
-                # Create white background
-                background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                if pil_image.mode == 'RGBA':
-                    background.paste(pil_image, mask=pil_image.split()[-1])  # Use alpha channel as mask
-                else:
-                    background.paste(pil_image, mask=pil_image.split()[-1])
-                pil_image = background
-            elif pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-            
-            # Save as high-quality JPEG (more compatible than PNG)
-            img_buffer = io.BytesIO()
-            pil_image.save(img_buffer, format='JPEG', quality=95, optimize=True)
-            final_img_data = img_buffer.getvalue()
-            
-            images.append(final_img_data)
-            
-            logger.info(f"Converted page {page_num + 1} to JPEG image ({len(final_img_data)} bytes)")
+            all_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+            logger.info(f"Extracted text from page {page_num + 1}: {len(page_text)} characters")
         
-        pdf_document.close()
-        logger.info(f"Successfully converted PDF to {len(images)} JPEG images")
-        return images
+        doc.close()
+        
+        # Clean the text
+        clean_text = clean_extracted_text(all_text)
+        logger.info(f"Successfully extracted and cleaned text: {len(clean_text)} characters total")
+        return clean_text
         
     except Exception as e:
-        logger.error(f"Error converting PDF to images: {str(e)}")
+        logger.error(f"Error extracting PDF text: {str(e)}")
         raise
+
+def clean_extracted_text(text: str) -> str:
+    """Clean extracted text (same as working Google Drive tool)"""
+    import re
+    # Remove excessive whitespace
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    text = re.sub(r" +", " ", text)
+    return text.strip()
 
 def identify_document_type_from_filename(filename: str) -> str:
     """Identify document type from filename."""
@@ -307,85 +309,93 @@ def identify_document_type_from_filename(filename: str) -> str:
     else:
         return 'unknown'
 
-def get_document_analysis_prompt(document_type: str) -> str:
-    """Get the appropriate prompt for document analysis based on type."""
+def get_financial_analysis_prompt(document_type: str, text_content: str) -> str:
+    """Get the appropriate prompt for financial analysis based on document type."""
     
-    base_prompt = """You are a professional tax and accounting AI assistant. Analyze this document image and extract key financial information.
+    base_prompt = f"""You are an expert financial analyst. Analyze this {document_type} document and extract key financial information in JSON format.
+
+Document content:
+{text_content}
 
 Please provide a JSON response with the following structure:
-{
-    "document_type": "type of document",
-    "key_figures": {
-        "field_name": "value"
-    },
-    "summary": "brief summary of the document",
-    "notable_items": ["list", "of", "important", "observations"]
-}
+{{
+    "document_type": "{document_type}",
+    "company_info": {{
+        "company_name": "extracted company name",
+        "period_covered": "time period of the document",
+        "prepared_by": "who prepared this document"
+    }},
+    "key_figures": {{
+        "revenue": "total revenue/sales amount",
+        "expenses": "total expenses",
+        "net_income": "net income or profit/loss",
+        "total_assets": "total assets if available",
+        "total_liabilities": "total liabilities if available",
+        "equity": "total equity if available",
+        "cash": "cash position if available"
+    }},
+    "summary": "comprehensive summary of the financial position and performance",
+    "notable_items": ["list", "of", "important", "observations", "and", "key", "findings"],
+    "year_over_year_changes": "any comparisons to prior periods if shown",
+    "financial_ratios": "any ratios that can be calculated from the data"
+}}
 
 """
     
     if document_type == 'tax_return':
         return base_prompt + """
-Focus on:
+Focus specifically on:
 - Form type (1120, 1120S, 1040, etc.)
 - Tax year
 - Taxpayer name and EIN/SSN
-- Key amounts: Gross income, Taxable income, Tax owed/refund, Net income/loss
-- Schedule information if present
+- Adjusted Gross Income, Taxable Income, Tax owed/refund
+- Schedule information and deductions
 - Any unusual items or red flags
 """
     
     elif document_type == 'financial_statement':
         return base_prompt + """
-Focus on:
+Focus specifically on:
 - Statement type (Income Statement, Balance Sheet, Cash Flow)
-- Period covered
-- Company name
-- Key amounts: Revenue, Net Income, Total Assets, Total Liabilities, Equity
-- Year-over-year changes if comparative
-- Any unusual items or significant variances
+- Company name and period
+- Revenue trends and major revenue sources
+- Expense categories and cost structure
+- Profitability metrics and margins
+- Asset composition and liquidity
+- Debt levels and equity structure
+- Cash flow from operations, investing, financing
 """
     
     else:
         return base_prompt + """
 Focus on:
-- Document purpose and type
-- Key parties involved
-- Important dates and amounts
-- Critical terms or conditions
-- Any unusual or notable items
+- Document purpose and key financial data
+- Important parties and entities involved
+- Critical amounts, dates, and terms
+- Any unusual or notable financial items
 """
 
-def analyze_image_with_vision(image_data: bytes, document_type: str, page_number: int) -> Dict[str, Any]:
-    """Analyze a single image using OpenAI Vision API."""
+def analyze_document_with_chatgpt(text_content: str, document_type: str) -> Dict[str, Any]:
+    """Analyze document text using ChatGPT API (same approach as working Google Drive tool)"""
     if not REQUESTS_AVAILABLE or not OPENAI_API_KEY:
         raise Exception("Requests library not available or OpenAI API key not configured")
     
     try:
-        logger.info(f"Starting Vision API analysis for page {page_number}...")
-        
-        # Encode image to base64
-        image_base64 = base64.b64encode(image_data).decode('utf-8')
-        logger.info(f"Encoded image to base64: {len(image_base64)} characters")
+        logger.info(f"Starting ChatGPT analysis for {document_type}...")
         
         # Get appropriate prompt
-        prompt = get_document_analysis_prompt(document_type)
+        prompt = get_financial_analysis_prompt(document_type, text_content)
         
-        # Add page context
-        if page_number > 1:
-            prompt += f"\n\nThis is page {page_number} of the document. Focus on the content visible on this specific page."
+        logger.info(f"Using financial analysis prompt for {document_type}")
+        logger.info("Calling OpenAI ChatGPT API...")
         
-        logger.info(f"Using prompt: {prompt[:100]}...")
-        logger.info("Calling OpenAI Vision API...")
-        
-        # Use requests library for API calls
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
         
         # Try multiple models with fallback
-        models_to_try = ["gpt-4o", "gpt-4-vision-preview"]
+        models_to_try = ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"]
         
         for model_name in models_to_try:
             try:
@@ -395,28 +405,23 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                     "model": model_name,
                     "messages": [
                         {
+                            "role": "system",
+                            "content": "You are an expert financial analyst specializing in reading and interpreting financial statements, tax returns, and business financial documents. Always respond with valid JSON."
+                        },
+                        {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_base64}",
-                                        "detail": "high"
-                                    }
-                                }
-                            ]
+                            "content": prompt
                         }
                     ],
-                    "max_tokens": 1000,
-                    "temperature": 0.1
+                    "max_tokens": 2000,
+                    "temperature": 0.1  # Low temperature for factual analysis
                 }
                 
                 response = requests.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=60
+                    timeout=120
                 )
                 
                 logger.info(f"API Response Status: {response.status_code}")
@@ -424,7 +429,7 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                 if response.status_code == 200:
                     result = response.json()
                     content = result['choices'][0]['message']['content']
-                    logger.info(f"✓ Vision API call successful with {model_name}")
+                    logger.info(f"✓ ChatGPT API call successful with {model_name}")
                     logger.info(f"Received response: {len(content)} characters")
                     break
                 else:
@@ -440,227 +445,205 @@ def analyze_image_with_vision(image_data: bytes, document_type: str, page_number
                     raise model_error
                 continue  # Try next model
         
-        # Try to parse as JSON, fallback to text if not valid JSON
+        # Try to parse as JSON
         try:
             analysis = json.loads(content)
             logger.info("✓ Response parsed as valid JSON")
         except json.JSONDecodeError:
-            logger.info("Response is not JSON, storing as raw text")
+            logger.info("Response is not valid JSON, creating structured response")
             analysis = {
-                "raw_response": content,
-                "parsed": False
+                "document_type": document_type,
+                "raw_analysis": content,
+                "parsed": False,
+                "error": "Response was not valid JSON"
             }
         
-        analysis['page_number'] = page_number
         analysis['model_used'] = model_name
+        analysis['analysis_method'] = 'text_extraction_chatgpt'
         
-        logger.info(f"✓ Successfully analyzed page {page_number} with Vision API")
+        logger.info(f"✓ Successfully analyzed document with ChatGPT")
         return analysis
         
     except Exception as e:
-        logger.error(f"✗ Error analyzing image with Vision API: {str(e)}")
+        logger.error(f"✗ Error analyzing document with ChatGPT: {str(e)}")
         logger.error(f"✗ Full error details: {repr(e)}")
         raise
 
-def consolidate_page_analyses(page_analyses: List[Dict[str, Any]], document_type: str) -> Dict[str, Any]:
-    """Consolidate analyses from multiple pages into a single document summary."""
-    
-    consolidated = {
-        "document_type": document_type,
-        "total_pages": len(page_analyses),
-        "key_figures_consolidated": {},
-        "full_summary": "",
-        "page_summaries": [],
-        "notable_items_all": []
-    }
-    
-    # Collect data from all pages
-    for page_analysis in page_analyses:
-        if isinstance(page_analysis, dict):
-            if "key_figures" in page_analysis:
-                consolidated["key_figures_consolidated"].update(page_analysis["key_figures"])
-            
-            if "summary" in page_analysis:
-                consolidated["page_summaries"].append({
-                    "page": page_analysis.get("page_number", 0),
-                    "summary": page_analysis["summary"]
-                })
-            
-            if "notable_items" in page_analysis:
-                consolidated["notable_items_all"].extend(page_analysis["notable_items"])
-    
-    # Create consolidated summary
-    if consolidated["page_summaries"]:
-        consolidated["full_summary"] = " ".join([ps["summary"] for ps in consolidated["page_summaries"]])
-    
-    return consolidated
-
-def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
-    """Process a document using Vision API approach with detailed diagnostics."""
+def process_document_with_text_analysis(doc_info: Dict, drive_service) -> bool:
+    """Process a document using text extraction + ChatGPT analysis (proven approach)"""
     try:
-        logger.info(f"=== DIAGNOSTIC MODE: Processing {doc_info['file_name']} ===")
+        logger.info(f"=== TEXT ANALYSIS MODE: Processing {doc_info['file_name']} ===")
         
         # Step 1: Download file
         logger.info("Step 1: Downloading file from Google Drive...")
         file_content = download_file_from_drive(drive_service, doc_info["drive_file_id"])
         logger.info(f"✓ Downloaded {len(file_content.getvalue())} bytes")
         
-        # Step 2: Convert to images
-        logger.info("Step 2: Converting PDF to images...")
-        images = pdf_to_images(file_content)
-        if not images:
-            raise Exception("No images generated from PDF")
-        logger.info(f"✓ Generated {len(images)} images, processing first 2 for diagnostic")
+        # Step 2: Extract text content
+        logger.info("Step 2: Extracting text content from PDF...")
+        text_content = extract_pdf_text_content(file_content)
+        if not text_content or len(text_content.strip()) < 100:
+            raise Exception("Insufficient text content extracted from PDF")
+        logger.info(f"✓ Extracted {len(text_content)} characters of text")
         
         # Step 3: Document type
         document_type = identify_document_type_from_filename(doc_info["file_name"])
         logger.info(f"✓ Document type: {document_type}")
         
-        # Step 4: Test Vision API with just 1 page
-        logger.info("Step 4: Testing Vision API with page 1...")
+        # Step 4: Analyze with ChatGPT
+        logger.info("Step 4: Analyzing content with ChatGPT...")
+        analysis_result = analyze_document_with_chatgpt(text_content, document_type)
+        logger.info(f"✓ ChatGPT analysis complete")
+        
+        # Step 5: Store results in database with complete metadata
+        logger.info("Step 5: Storing complete results in database...")
+        conn = get_postgres_connection()
         try:
-            test_analysis = analyze_image_with_vision(images[0], document_type, 1)
-            logger.info(f"✓ Vision API SUCCESS! Response: {str(test_analysis)[:200]}...")
-            
-            # Step 5: Store test result directly in database
-            logger.info("Step 5: Storing results in database...")
-            conn = get_postgres_connection()
-            try:
-                with conn.cursor() as cursor:
-                    # Check if document exists in ai_data.documents and get its ID
+            with conn.cursor() as cursor:
+                # Check if document exists in ai_data.documents
+                cursor.execute(
+                    """
+                    SELECT id FROM ai_data.documents 
+                    WHERE drive_file_id = %s
+                    """,
+                    (doc_info["drive_file_id"],)
+                )
+                
+                doc_row = cursor.fetchone()
+                
+                # Prepare comprehensive data
+                full_document_text = text_content[:5000] + "..." if len(text_content) > 5000 else text_content
+                financial_summary = json.dumps({
+                    "analysis_method": "text_extraction_chatgpt",
+                    "document_type": document_type,
+                    "analysis_result": analysis_result,
+                    "processing_timestamp": time.time(),
+                    "text_length": len(text_content)
+                })
+                vision_analysis = json.dumps(analysis_result)  # Store ChatGPT analysis in vision_analysis field
+                
+                if doc_row:
+                    # Update existing document with complete metadata from tracking
+                    document_id = doc_row[0]
+                    logger.info(f"Updating existing document with ID: {document_id}")
+                    
                     cursor.execute(
                         """
-                        SELECT id FROM ai_data.documents 
+                        UPDATE ai_data.documents 
+                        SET client_id = %s,
+                            document_name = %s,
+                            year = %s,
+                            month = %s,
+                            day = %s,
+                            class = %s,
+                            subclass = %s,
+                            is_new = %s,
+                            full_document_text = %s, 
+                            financial_summary = %s,
+                            vision_analysis = %s,
+                            total_chunks = 1,
+                            processed_at = NOW()
                         WHERE drive_file_id = %s
-                        """,
-                        (doc_info["drive_file_id"],)
-                    )
-                    
-                    doc_row = cursor.fetchone()
-                    
-                    test_summary = f"TEST VISION API RESULT: {str(test_analysis)[:500]}"
-                    test_financial = json.dumps({
-                        "test": "vision_api_working", 
-                        "page_1_analysis": str(test_analysis)[:200],
-                        "model_used": test_analysis.get("model_used", "unknown"),
-                        "timestamp": time.time()
-                    })
-                    
-                    if doc_row:
-                        # Update existing document
-                        document_id = doc_row[0]
-                        logger.info(f"Found existing document with ID: {document_id}")
-                        
-                        cursor.execute(
-                            """
-                            UPDATE ai_data.documents 
-                            SET full_document_text = %s, 
-                                financial_summary = %s,
-                                vision_analysis = %s,
-                                total_chunks = %s,
-                                processed_at = NOW()
-                            WHERE drive_file_id = %s
-                            """,
-                            (test_summary, test_financial, json.dumps(test_analysis), len(images), doc_info["drive_file_id"])
-                        )
-                        
-                        rows_updated = cursor.rowcount
-                        logger.info(f"✓ Database UPDATE: {rows_updated} rows updated")
-                    else:
-                        # Insert new document and get its ID
-                        logger.info("Document not found in ai_data.documents, inserting new record...")
-                        
-                        cursor.execute(
-                            """
-                            INSERT INTO ai_data.documents 
-                            (drive_file_id, document_name, full_document_text, financial_summary, vision_analysis, total_chunks, processed_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                            RETURNING id
-                            """,
-                            (doc_info["drive_file_id"], doc_info["file_name"], test_summary, test_financial, json.dumps(test_analysis), len(images))
-                        )
-                        
-                        document_id = cursor.fetchone()[0]
-                        logger.info(f"✓ New document inserted with ID: {document_id}")
-                    
-                    # Clean up old embeddings and insert test embedding with correct document_id
-                    cursor.execute(
-                        """
-                        DELETE FROM ai_data.document_embeddings 
-                        WHERE drive_file_id = %s
-                        """,
-                        (doc_info["drive_file_id"],)
-                    )
-                    
-                    cursor.execute(
-                        """
-                        INSERT INTO ai_data.document_embeddings
-                        (client_id, document_name, chunk_index, chunk_text, year, month, day,
-                         class, subclass, document_id, drive_file_id, embedding)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
-                            doc_info.get("client_id", 1),
-                            doc_info["file_name"],
-                            1,
-                            f"DIAGNOSTIC: Vision API result: {str(test_analysis)[:1000]}",
-                            doc_info.get("year", 2024),
-                            doc_info.get("month", 12),
-                            doc_info.get("day", 1),
-                            doc_info.get("class", "financial"),
-                            doc_info.get("subclass", "statement"),
-                            document_id,  # Use the actual document ID instead of hardcoded 20
-                            doc_info["drive_file_id"],
-                            [0.0] * 384  # Dummy embedding vector
+                            doc_info.get("client_id"),
+                            doc_info.get("file_name"),
+                            doc_info.get("year"),
+                            doc_info.get("month"),
+                            doc_info.get("day"),
+                            doc_info.get("class"),
+                            doc_info.get("subclass"),
+                            doc_info.get("is_new"),
+                            full_document_text,
+                            financial_summary,
+                            vision_analysis,
+                            doc_info["drive_file_id"]
                         )
                     )
                     
-                    conn.commit()
-                    logger.info("✓ Test data committed to database")
+                    rows_updated = cursor.rowcount
+                    logger.info(f"✓ Database UPDATE: {rows_updated} rows updated with complete metadata")
+                else:
+                    # Insert new document with complete metadata
+                    logger.info("Document not found in ai_data.documents, inserting new record...")
                     
-                    # Update status
-                    update_document_status(doc_info["id"], "processed")
-                    logger.info("✓ Status updated to processed")
-                    
-                    return True
-                    
-            except Exception as db_error:
-                conn.rollback()
-                logger.error(f"✗ Database error: {str(db_error)}")
-                logger.error(f"✗ Full database error: {repr(db_error)}")
-                return False
-            finally:
-                conn.close()
-                
-        except Exception as vision_error:
-            logger.error(f"✗ Vision API error: {str(vision_error)}")
-            logger.error(f"✗ Full Vision API error: {repr(vision_error)}")
-            
-            # Store error info in database for debugging
-            conn = get_postgres_connection()
-            try:
-                with conn.cursor() as cursor:
-                    error_summary = f"VISION API ERROR: {str(vision_error)}"
-                    
-                    # Try to update existing document or insert new one
                     cursor.execute(
                         """
-                        INSERT INTO ai_data.documents (drive_file_id, document_name, full_document_text, processed_at)
-                        VALUES (%s, %s, %s, NOW())
-                        ON CONFLICT (drive_file_id) 
-                        DO UPDATE SET document_name = EXCLUDED.document_name, full_document_text = EXCLUDED.full_document_text, processed_at = NOW()
+                        INSERT INTO ai_data.documents 
+                        (drive_file_id, client_id, document_name, year, month, day, class, subclass, is_new,
+                         full_document_text, financial_summary, vision_analysis, total_chunks, processed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        RETURNING id
                         """,
-                        (doc_info["drive_file_id"], doc_info["file_name"], error_summary)
+                        (
+                            doc_info["drive_file_id"],
+                            doc_info.get("client_id"),
+                            doc_info.get("file_name"),
+                            doc_info.get("year"),
+                            doc_info.get("month"),
+                            doc_info.get("day"),
+                            doc_info.get("class"),
+                            doc_info.get("subclass"),
+                            doc_info.get("is_new"),
+                            full_document_text,
+                            financial_summary,
+                            vision_analysis,
+                            1
+                        )
                     )
-                    conn.commit()
-                    logger.info("✓ Error info stored in database")
-            except Exception as e:
-                logger.error(f"Failed to store error info: {e}")
-            finally:
-                conn.close()
+                    
+                    document_id = cursor.fetchone()[0]
+                    logger.info(f"✓ New document inserted with ID: {document_id}")
                 
-            update_document_status(doc_info["id"], "error", str(vision_error))
+                # Clean up old embeddings and insert comprehensive embedding
+                cursor.execute(
+                    """
+                    DELETE FROM ai_data.document_embeddings 
+                    WHERE drive_file_id = %s
+                    """,
+                    (doc_info["drive_file_id"],)
+                )
+                
+                # Create embedding with the analysis result
+                cursor.execute(
+                    """
+                    INSERT INTO ai_data.document_embeddings
+                    (client_id, document_name, chunk_index, chunk_text, year, month, day,
+                     class, subclass, document_id, drive_file_id, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        doc_info.get("client_id"),
+                        doc_info.get("file_name"),
+                        1,
+                        f"Financial Analysis: {str(analysis_result)[:1000]}",
+                        doc_info.get("year"),
+                        doc_info.get("month"),
+                        doc_info.get("day"),
+                        doc_info.get("class"),
+                        doc_info.get("subclass"),
+                        document_id,
+                        doc_info["drive_file_id"],
+                        [0.0] * 384  # Dummy embedding vector
+                    )
+                )
+                
+                conn.commit()
+                logger.info(f"✓ Complete data committed to database")
+                
+                # Update status
+                update_document_status(doc_info["id"], "processed")
+                logger.info("✓ Status updated to processed")
+                
+                return True
+                
+        except Exception as db_error:
+            conn.rollback()
+            logger.error(f"✗ Database error: {str(db_error)}")
+            logger.error(f"✗ Full database error: {repr(db_error)}")
             return False
+        finally:
+            conn.close()
             
     except Exception as e:
         logger.error(f"✗ Overall process error: {str(e)}")
@@ -669,7 +652,7 @@ def process_document_with_vision(doc_info: Dict, drive_service) -> bool:
         return False
 
 def process_pending_documents():
-    """Process all pending documents using Vision API."""
+    """Process all pending documents using text extraction + ChatGPT analysis."""
     try:
         # Check database schema first
         if not check_database_schema():
@@ -694,7 +677,7 @@ def process_pending_documents():
         # Process each document
         for doc in pending_docs:
             logger.info(f"Processing document: {doc['file_name']} (ID: {doc['id']})")
-            success = process_document_with_vision(doc, drive_service)
+            success = process_document_with_text_analysis(doc, drive_service)
             if success:
                 documents_processed += 1
             else:
@@ -722,10 +705,11 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         response = {
             'status': 'healthy',
-            'approach': 'vision-api',
+            'approach': 'text-extraction-chatgpt',
             'capabilities': {
                 'pymupdf': PYMUPDF_AVAILABLE,
                 'pil': PIL_AVAILABLE,
+                'tesseract': TESSERACT_AVAILABLE,
                 'requests': REQUESTS_AVAILABLE,
                 'api_key_configured': bool(OPENAI_API_KEY)
             }
@@ -762,7 +746,7 @@ def run_server():
     
     try:
         server = socketserver.TCPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-        logger.info(f'Starting Vision-based document processor on port {port}')
+        logger.info(f'Starting Text-based document processor on port {port}')
         server.serve_forever()
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
@@ -770,9 +754,10 @@ def run_server():
 
 if __name__ == "__main__":
     # Test basic functionality before starting server
-    logger.info("=== Starting Vision-based Document Processor ===")
+    logger.info("=== Starting Text-Based Document Processor ===")
     logger.info(f"PyMuPDF available: {PYMUPDF_AVAILABLE}")
     logger.info(f"PIL available: {PIL_AVAILABLE}")
+    logger.info(f"Tesseract available: {TESSERACT_AVAILABLE}")
     logger.info(f"Requests available: {REQUESTS_AVAILABLE}")
     logger.info(f"OpenAI API key configured: {bool(OPENAI_API_KEY)}")
     
